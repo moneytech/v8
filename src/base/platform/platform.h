@@ -37,11 +37,6 @@
 
 namespace v8 {
 
-namespace internal {
-// TODO(bbudge) Move this to libplatform.
-class DefaultMemoryManager;
-}  // namespace internal
-
 namespace base {
 
 // ----------------------------------------------------------------------------
@@ -53,24 +48,24 @@ namespace base {
 
 #define V8_FAST_TLS_SUPPORTED 1
 
-INLINE(intptr_t InternalGetExistingThreadLocal(intptr_t index));
+V8_INLINE intptr_t InternalGetExistingThreadLocal(intptr_t index);
 
 inline intptr_t InternalGetExistingThreadLocal(intptr_t index) {
   const intptr_t kTibInlineTlsOffset = 0xE10;
   const intptr_t kTibExtraTlsOffset = 0xF94;
   const intptr_t kMaxInlineSlots = 64;
   const intptr_t kMaxSlots = kMaxInlineSlots + 1024;
-  const intptr_t kPointerSize = sizeof(void*);
+  const intptr_t kSystemPointerSize = sizeof(void*);
   DCHECK(0 <= index && index < kMaxSlots);
   USE(kMaxSlots);
   if (index < kMaxInlineSlots) {
-    return static_cast<intptr_t>(__readfsdword(kTibInlineTlsOffset +
-                                               kPointerSize * index));
+    return static_cast<intptr_t>(
+        __readfsdword(kTibInlineTlsOffset + kSystemPointerSize * index));
   }
   intptr_t extra = static_cast<intptr_t>(__readfsdword(kTibExtraTlsOffset));
   DCHECK_NE(extra, 0);
-  return *reinterpret_cast<intptr_t*>(extra +
-                                      kPointerSize * (index - kMaxInlineSlots));
+  return *reinterpret_cast<intptr_t*>(extra + kSystemPointerSize *
+                                                  (index - kMaxInlineSlots));
 }
 
 #elif defined(__APPLE__) && (V8_HOST_ARCH_IA32 || V8_HOST_ARCH_X64)
@@ -79,7 +74,7 @@ inline intptr_t InternalGetExistingThreadLocal(intptr_t index) {
 
 extern V8_BASE_EXPORT intptr_t kMacTlsBaseOffset;
 
-INLINE(intptr_t InternalGetExistingThreadLocal(intptr_t index));
+V8_INLINE intptr_t InternalGetExistingThreadLocal(intptr_t index);
 
 inline intptr_t InternalGetExistingThreadLocal(intptr_t index) {
   intptr_t result;
@@ -99,9 +94,8 @@ inline intptr_t InternalGetExistingThreadLocal(intptr_t index) {
 
 #endif  // V8_NO_FAST_TLS
 
-
+class PageAllocator;
 class TimezoneCache;
-
 
 // ----------------------------------------------------------------------------
 // OS
@@ -113,11 +107,9 @@ class TimezoneCache;
 class V8_BASE_EXPORT OS {
  public:
   // Initialize the OS class.
-  // - random_seed: Used for the GetRandomMmapAddress() if non-zero.
   // - hard_abort: If true, OS::Abort() will crash instead of aborting.
   // - gc_fake_mmap: Name of the file for fake gc mmap used in ll_prof.
-  static void Initialize(int64_t random_seed, bool hard_abort,
-                         const char* const gc_fake_mmap);
+  static void Initialize(bool hard_abort, const char* const gc_fake_mmap);
 
   // Returns the accumulated user time for thread. This routine
   // can be used for profiling. The implementation should
@@ -163,11 +155,11 @@ class V8_BASE_EXPORT OS {
   static PRINTF_FORMAT(1, 2) void PrintError(const char* format, ...);
   static PRINTF_FORMAT(1, 0) void VPrintError(const char* format, va_list args);
 
-  // OS memory management API. Except for testing, use the equivalent API in
-  // v8::internal (src/allocation.h).
-
+  // Memory permissions. These should be kept in sync with the ones in
+  // v8::PageAllocator.
   enum class MemoryPermission {
     kNoAccess,
+    kRead,
     kReadWrite,
     // TODO(hpayer): Remove this flag. Memory should never be rwx.
     kReadWriteExecute,
@@ -196,11 +188,14 @@ class V8_BASE_EXPORT OS {
 
   class V8_BASE_EXPORT MemoryMappedFile {
    public:
-    virtual ~MemoryMappedFile() {}
+    enum class FileMode { kReadOnly, kReadWrite };
+
+    virtual ~MemoryMappedFile() = default;
     virtual void* memory() const = 0;
     virtual size_t size() const = 0;
 
-    static MemoryMappedFile* open(const char* name);
+    static MemoryMappedFile* open(const char* name,
+                                  FileMode mode = FileMode::kReadWrite);
     static MemoryMappedFile* create(const char* name, size_t size,
                                     void* initial);
   };
@@ -212,7 +207,6 @@ class V8_BASE_EXPORT OS {
   static PRINTF_FORMAT(3, 0) int VSNPrintF(char* str, int length,
                                            const char* format, va_list args);
 
-  static char* StrChr(char* str, int c);
   static void StrNCpy(char* dest, int length, const char* src, size_t n);
 
   // Support for the profiler.  Can do nothing, in which case ticks
@@ -254,15 +248,21 @@ class V8_BASE_EXPORT OS {
 
   static int GetCurrentThreadId();
 
+  static void AdjustSchedulingParams();
+
+  static void ExitProcess(int exit_code);
+
  private:
   // These classes use the private memory management API below.
   friend class MemoryMappedFile;
   friend class PosixMemoryMappedFile;
-  friend class v8::internal::DefaultMemoryManager;
+  friend class v8::base::PageAllocator;
 
   static size_t AllocatePageSize();
 
   static size_t CommitPageSize();
+
+  static void SetRandomMmapSeed(int64_t seed);
 
   static void* GetRandomMmapAddr();
 
@@ -277,6 +277,9 @@ class V8_BASE_EXPORT OS {
   V8_WARN_UNUSED_RESULT static bool SetPermissions(void* address, size_t size,
                                                    MemoryPermission access);
 
+  V8_WARN_UNUSED_RESULT static bool DiscardSystemPages(void* address,
+                                                       size_t size);
+
   static const int msPerSecond = 1000;
 
 #if V8_OS_POSIX
@@ -285,6 +288,18 @@ class V8_BASE_EXPORT OS {
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(OS);
 };
+
+#if (defined(_WIN32) || defined(_WIN64))
+V8_BASE_EXPORT void EnsureConsoleOutputWin32();
+#endif  // (defined(_WIN32) || defined(_WIN64))
+
+inline void EnsureConsoleOutput() {
+#if (defined(_WIN32) || defined(_WIN64))
+  // Windows requires extra calls to send assert output to the console
+  // rather than a dialog box.
+  EnsureConsoleOutputWin32();
+#endif  // (defined(_WIN32) || defined(_WIN64))
+}
 
 // ----------------------------------------------------------------------------
 // Thread
@@ -297,7 +312,7 @@ class V8_BASE_EXPORT OS {
 class V8_BASE_EXPORT Thread {
  public:
   // Opaque data type for thread-local storage keys.
-  typedef int32_t LocalStorageKey;
+  using LocalStorageKey = int32_t;
 
   class Options {
    public:
@@ -318,15 +333,16 @@ class V8_BASE_EXPORT Thread {
   virtual ~Thread();
 
   // Start new thread by calling the Run() method on the new thread.
-  void Start();
+  V8_WARN_UNUSED_RESULT bool Start();
 
   // Start new thread and wait until Run() method is called on the new thread.
-  void StartSynchronously() {
+  bool StartSynchronously() {
     start_semaphore_ = new Semaphore(0);
-    Start();
+    if (!Start()) return false;
     start_semaphore_->Wait();
     delete start_semaphore_;
     start_semaphore_ = nullptr;
+    return true;
   }
 
   // Wait until thread terminates.

@@ -36,6 +36,17 @@ let testSuite = [
     }));
   },
 
+  async function testUnserializableArguments() {
+    InspectorTest.logMessage(await callFunctionOn({
+      objectId: remoteObject1.objectId,
+      functionDeclaration: 'function(arg1, arg2, arg3, arg4, arg5) { return \'\' + Object.is(arg1, -0) + \'|\' + Object.is(arg2, NaN) + \'|\' + Object.is(arg3, Infinity) + \'|\' + Object.is(arg4, -Infinity) + \'|\' + (typeof arg5); }',
+      arguments: prepareArguments([-0, NaN, Infinity, -Infinity, 2n]),
+      returnByValue: true,
+      generatePreview: false,
+      awaitPromise: false
+    }));
+  },
+
   async function testComplexArguments() {
     InspectorTest.logMessage(await callFunctionOn({
       objectId: remoteObject1.objectId,
@@ -135,6 +146,28 @@ let testSuite = [
       awaitPromise: false
     }));
   },
+
+  async function testThrowNumber() {
+    InspectorTest.logMessage(await callFunctionOn({
+      executionContextId,
+      functionDeclaration: '(() => { throw 100500; } )',
+      arguments: prepareArguments([]),
+      returnByValue: true,
+      generatePreview: false,
+      awaitPromise: true
+    }));
+  },
+
+  async function testAsyncFunctionWithUnknownReferenceReturnByValue() {
+    InspectorTest.logMessage(await callFunctionOn({
+      executionContextId,
+      functionDeclaration: '(async () => does_not_exist.click())',
+      arguments: prepareArguments([]),
+      returnByValue: true,
+      generatePreview: false,
+      awaitPromise: true
+    }));
+  },
 ];
 
 function prepareArguments(args) {
@@ -143,6 +176,8 @@ function prepareArguments(args) {
       return {unserializableValue: '-0'};
     if (Object.is(arg, NaN) || Object.is(arg, Infinity) || Object.is(arg, -Infinity))
       return {unserializableValue: arg + ''};
+    if (typeof arg === 'bigint')
+      return {unserializableValue: arg + 'n'};
     if (arg && arg.objectId)
       return {objectId: arg.objectId};
     return {value: arg};

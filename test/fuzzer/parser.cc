@@ -10,22 +10,23 @@
 #include <list>
 
 #include "include/v8.h"
-#include "src/objects-inl.h"
-#include "src/objects.h"
+#include "src/objects/objects-inl.h"
+#include "src/objects/objects.h"
 #include "src/parsing/parse-info.h"
 #include "src/parsing/parsing.h"
 #include "src/parsing/preparser.h"
 #include "test/fuzzer/fuzzer-support.h"
 
 bool IsValidInput(const uint8_t* data, size_t size) {
-  std::list<char> parentheses;
+  // Ignore too long inputs as they tend to find OOM or timeouts, not real bugs.
+  if (size > 2048) return false;
+
+  std::vector<char> parentheses;
   const char* ptr = reinterpret_cast<const char*>(data);
 
   for (size_t i = 0; i != size; ++i) {
     // Check that all characters in the data are valid.
-    if (!(std::isspace(ptr[i]) || std::isprint(ptr[i]))) {
-      return false;
-    }
+    if (!std::isspace(ptr[i]) && !std::isprint(ptr[i])) return false;
 
     // Check balance of parentheses in the data.
     switch (ptr[i]) {
@@ -35,15 +36,15 @@ bool IsValidInput(const uint8_t* data, size_t size) {
         parentheses.push_back(ptr[i]);
         break;
       case ')':
-        if (parentheses.back() != '(') return false;
+        if (parentheses.empty() || parentheses.back() != '(') return false;
         parentheses.pop_back();
         break;
       case ']':
-        if (parentheses.back() != '[') return false;
+        if (parentheses.empty() || parentheses.back() != '[') return false;
         parentheses.pop_back();
         break;
       case '}':
-        if (parentheses.back() != '{') return false;
+        if (parentheses.empty() || parentheses.back() != '{') return false;
         parentheses.pop_back();
         break;
       default:
@@ -79,7 +80,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
   v8::internal::Handle<v8::internal::Script> script =
       factory->NewScript(source.ToHandleChecked());
-  v8::internal::ParseInfo info(script);
+  v8::internal::ParseInfo info(i_isolate, script);
   if (!v8::internal::parsing::ParseProgram(&info, i_isolate)) {
     i_isolate->OptionalRescheduleException(true);
   }

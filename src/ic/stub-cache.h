@@ -2,11 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef V8_STUB_CACHE_H_
-#define V8_STUB_CACHE_H_
+#ifndef V8_IC_STUB_CACHE_H_
+#define V8_IC_STUB_CACHE_H_
 
-#include "src/macro-assembler.h"
 #include "src/objects/name.h"
+#include "src/objects/tagged-value.h"
 
 namespace v8 {
 namespace internal {
@@ -29,19 +29,23 @@ class SCTableReference {
   friend class StubCache;
 };
 
-
-class StubCache {
+class V8_EXPORT_PRIVATE StubCache {
  public:
   struct Entry {
-    Name* key;
-    Object* value;
-    Map* map;
+    // {key} is a tagged Name pointer, may be cleared by setting to empty
+    // string.
+    StrongTaggedValue key;
+    // {value} is a tagged heap object reference (weak or strong), equivalent
+    // to a MaybeObject's payload.
+    TaggedValue value;
+    // {map} is a tagged Map pointer, may be cleared by setting to Smi::zero().
+    StrongTaggedValue map;
   };
 
   void Initialize();
   // Access cache for entry hash(name, map).
-  Object* Set(Name* name, Map* map, Object* handler);
-  Object* Get(Name* name, Map* map);
+  void Set(Name name, Map map, MaybeObject handler);
+  MaybeObject Get(Name name, Map map);
   // Clear the lookup table (@ mark compact collection).
   void Clear();
 
@@ -74,26 +78,30 @@ class StubCache {
 
   Isolate* isolate() { return isolate_; }
 
-  // Setting the entry size such that the index is shifted by Name::kHashShift
-  // is convenient; shifting down the length field (to extract the hash code)
-  // automatically discards the hash bit field.
-  static const int kCacheIndexShift = Name::kHashShift;
+  // Ideally we would set kCacheIndexShift to Name::kHashShift, such that
+  // the bit field inside the hash field gets shifted out implicitly. However,
+  // sizeof(Entry) needs to be a multiple of 1 << kCacheIndexShift, and it
+  // isn't clear whether letting one bit of the bit field leak into the index
+  // computation is bad enough to warrant an additional shift to get rid of it.
+  static const int kCacheIndexShift = 2;
+  // The purpose of the static assert is to make us reconsider this choice
+  // if the bit field ever grows even more.
+  STATIC_ASSERT(kCacheIndexShift == Name::kHashShift - 1);
 
   static const int kPrimaryTableBits = 11;
   static const int kPrimaryTableSize = (1 << kPrimaryTableBits);
   static const int kSecondaryTableBits = 9;
   static const int kSecondaryTableSize = (1 << kSecondaryTableBits);
 
+  // We compute the hash code for a map as follows:
+  //   <code> = <address> ^ (<address> >> kMapKeyShift)
+  static const int kMapKeyShift = kPrimaryTableBits + kCacheIndexShift;
+
   // Some magic number used in the secondary hash computation.
   static const int kSecondaryMagic = 0xb16ca6e5;
 
-  static int PrimaryOffsetForTesting(Name* name, Map* map) {
-    return PrimaryOffset(name, map);
-  }
-
-  static int SecondaryOffsetForTesting(Name* name, int seed) {
-    return SecondaryOffset(name, seed);
-  }
+  static int PrimaryOffsetForTesting(Name name, Map map);
+  static int SecondaryOffsetForTesting(Name name, int seed);
 
   // The constructor is made public only for the purposes of testing.
   explicit StubCache(Isolate* isolate);
@@ -109,12 +117,12 @@ class StubCache {
   // Hash algorithm for the primary table.  This algorithm is replicated in
   // assembler for every architecture.  Returns an index into the table that
   // is scaled by 1 << kCacheIndexShift.
-  static int PrimaryOffset(Name* name, Map* map);
+  static int PrimaryOffset(Name name, Map map);
 
   // Hash algorithm for the secondary table.  This algorithm is replicated in
   // assembler for every architecture.  Returns an index into the table that
   // is scaled by 1 << kCacheIndexShift.
-  static int SecondaryOffset(Name* name, int seed);
+  static int SecondaryOffset(Name name, int seed);
 
   // Compute the entry for a given offset in exactly the same way as
   // we do in generated code.  We generate an hash code that already
@@ -122,7 +130,10 @@ class StubCache {
   // of sizeof(Entry).  This makes it easier to avoid making mistakes
   // in the hashed offset computations.
   static Entry* entry(Entry* table, int offset) {
-    const int multiplier = sizeof(*table) >> Name::kHashShift;
+    // The size of {Entry} must be a multiple of 1 << kCacheIndexShift.
+    STATIC_ASSERT((sizeof(*table) >> kCacheIndexShift) << kCacheIndexShift ==
+                  sizeof(*table));
+    const int multiplier = sizeof(*table) >> kCacheIndexShift;
     return reinterpret_cast<Entry*>(reinterpret_cast<Address>(table) +
                                     offset * multiplier);
   }
@@ -140,4 +151,4 @@ class StubCache {
 }  // namespace internal
 }  // namespace v8
 
-#endif  // V8_STUB_CACHE_H_
+#endif  // V8_IC_STUB_CACHE_H_

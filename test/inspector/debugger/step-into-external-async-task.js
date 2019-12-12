@@ -18,8 +18,11 @@ function store(description) {
 }
 //# sourceURL=utils.js`;
 
-contextGroup1.addScript(utilsScript);
+// TODO(rmcilroy): This has to be in this order since the i::Script object gets
+// reused via the CompilationCache, and we want OnAfterCompile to be called
+// for contextGroup1 last on this script.
 contextGroup2.addScript(utilsScript);
+contextGroup1.addScript(utilsScript);
 
 let frameworkScript = `
 function call(id, f) {
@@ -59,13 +62,6 @@ session2.setupScriptMap();
 
   InspectorTest.log('Run stepInto with breakOnAsyncCall flag');
   Protocol1.Debugger.stepInto({breakOnAsyncCall: true});
-  let {params: {asyncCallStackTraceId}} = await Protocol1.Debugger.oncePaused();
-
-  InspectorTest.log('Call pauseOnAsyncCall');
-  Protocol2.Debugger.pauseOnAsyncCall({
-    parentStackTraceId: asyncCallStackTraceId,
-  });
-  Protocol1.Debugger.resume();
 
   InspectorTest.log('Trigger external async task on another context group');
   let stackTraceId = (await evaluatePromise).result.result.value;

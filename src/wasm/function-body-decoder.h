@@ -7,8 +7,7 @@
 
 #include "src/base/compiler-specific.h"
 #include "src/base/iterator.h"
-#include "src/globals.h"
-#include "src/signature.h"
+#include "src/common/globals.h"
 #include "src/wasm/decoder.h"
 #include "src/wasm/wasm-opcodes.h"
 #include "src/wasm/wasm-result.h"
@@ -17,15 +16,10 @@ namespace v8 {
 namespace internal {
 
 class BitVector;  // forward declaration
-class Counters;
-
-namespace compiler {  // external declarations from compiler.
-class WasmGraphBuilder;
-}
 
 namespace wasm {
 
-typedef compiler::WasmGraphBuilder TFBuilder;
+class WasmFeatures;
 struct WasmModule;  // forward declaration of module interface.
 
 // A wrapper around the signature and bytes of a function.
@@ -34,56 +28,43 @@ struct FunctionBody {
   uint32_t offset;    // offset in the module bytes, for error reporting
   const byte* start;  // start of the function body
   const byte* end;    // end of the function body
+
+  FunctionBody(FunctionSig* sig, uint32_t offset, const byte* start,
+               const byte* end)
+      : sig(sig), offset(offset), start(start), end(end) {}
 };
 
-static inline FunctionBody FunctionBodyForTesting(const byte* start,
-                                                  const byte* end) {
-  return {nullptr, 0, start, end};
-}
-
 V8_EXPORT_PRIVATE DecodeResult VerifyWasmCode(AccountingAllocator* allocator,
-                                              const wasm::WasmModule* module,
-                                              FunctionBody& body);
+                                              const WasmFeatures& enabled,
+                                              const WasmModule* module,
+                                              WasmFeatures* detected,
+                                              const FunctionBody& body);
 
-// Note: If run in the background thread, must follow protocol using
-// isolate::async_counters() to guarantee usability of counters argument.
-DecodeResult VerifyWasmCodeWithStats(AccountingAllocator* allocator,
-                                     const wasm::WasmModule* module,
-                                     FunctionBody& body, bool is_wasm,
-                                     Counters* counters);
-
-DecodeResult BuildTFGraph(AccountingAllocator* allocator, TFBuilder* builder,
-                          FunctionBody& body);
+enum PrintLocals { kPrintLocals, kOmitLocals };
+V8_EXPORT_PRIVATE
 bool PrintRawWasmCode(AccountingAllocator* allocator, const FunctionBody& body,
-                      const wasm::WasmModule* module);
+                      const WasmModule* module, PrintLocals print_locals);
+
+V8_EXPORT_PRIVATE
+bool PrintRawWasmCode(AccountingAllocator* allocator, const FunctionBody& body,
+                      const WasmModule* module, PrintLocals print_locals,
+                      std::ostream& out,
+                      std::vector<int>* line_numbers = nullptr);
 
 // A simplified form of AST printing, e.g. from a debugger.
 void PrintRawWasmCode(const byte* start, const byte* end);
 
-inline DecodeResult VerifyWasmCode(AccountingAllocator* allocator,
-                                   const WasmModule* module, FunctionSig* sig,
-                                   const byte* start, const byte* end) {
-  FunctionBody body = {sig, 0, start, end};
-  return VerifyWasmCode(allocator, module, body);
-}
-
-inline DecodeResult BuildTFGraph(AccountingAllocator* allocator,
-                                 TFBuilder* builder, FunctionSig* sig,
-                                 const byte* start, const byte* end) {
-  FunctionBody body = {sig, 0, start, end};
-  return BuildTFGraph(allocator, builder, body);
-}
-
 struct BodyLocalDecls {
   // The size of the encoded declarations.
-  uint32_t encoded_size;  // size of encoded declarations
+  uint32_t encoded_size = 0;  // size of encoded declarations
 
   ZoneVector<ValueType> type_list;
 
-  explicit BodyLocalDecls(Zone* zone) : encoded_size(0), type_list(zone) {}
+  explicit BodyLocalDecls(Zone* zone) : type_list(zone) {}
 };
 
-V8_EXPORT_PRIVATE bool DecodeLocalDecls(BodyLocalDecls* decls,
+V8_EXPORT_PRIVATE bool DecodeLocalDecls(const WasmFeatures& enabled,
+                                        BodyLocalDecls* decls,
                                         const byte* start, const byte* end);
 
 V8_EXPORT_PRIVATE BitVector* AnalyzeLoopAssignmentForTesting(Zone* zone,

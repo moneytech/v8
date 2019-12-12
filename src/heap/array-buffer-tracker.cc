@@ -11,6 +11,11 @@
 #include "src/heap/heap.h"
 #include "src/heap/spaces.h"
 
+#define TRACE_BS(...)                                  \
+  do {                                                 \
+    if (FLAG_trace_backing_store) PrintF(__VA_ARGS__); \
+  } while (false)
+
 namespace v8 {
 namespace internal {
 
@@ -20,87 +25,85 @@ LocalArrayBufferTracker::~LocalArrayBufferTracker() {
 
 template <typename Callback>
 void LocalArrayBufferTracker::Process(Callback callback) {
-  std::vector<JSArrayBuffer::Allocation>* backing_stores_to_free =
-      new std::vector<JSArrayBuffer::Allocation>();
+  std::vector<std::shared_ptr<BackingStore>> backing_stores_to_free;
+  TrackingData kept_array_buffers;
 
-  JSArrayBuffer* new_buffer = nullptr;
-  JSArrayBuffer* old_buffer = nullptr;
-  size_t new_retained_size = 0;
-  size_t moved_size = 0;
+  JSArrayBuffer new_buffer;
+  JSArrayBuffer old_buffer;
+  size_t freed_memory = 0;
   for (TrackingData::iterator it = array_buffers_.begin();
-       it != array_buffers_.end();) {
-    old_buffer = reinterpret_cast<JSArrayBuffer*>(*it);
+       it != array_buffers_.end(); ++it) {
+    old_buffer = it->first;
+    DCHECK_EQ(page_, Page::FromHeapObject(old_buffer));
     const CallbackResult result = callback(old_buffer, &new_buffer);
     if (result == kKeepEntry) {
-      new_retained_size += NumberToSize(old_buffer->byte_length());
-      ++it;
+      kept_array_buffers.insert(std::move(*it));
     } else if (result == kUpdateEntry) {
-      DCHECK_NOT_NULL(new_buffer);
-      Page* target_page = Page::FromAddress(new_buffer->address());
+      DCHECK_EQ(old_buffer.byte_length(), new_buffer.byte_length());
+      DCHECK(!new_buffer.is_null());
+      Page* target_page = Page::FromHeapObject(new_buffer);
       {
-        base::LockGuard<base::Mutex> guard(target_page->mutex());
+        base::MutexGuard guard(target_page->mutex());
         LocalArrayBufferTracker* tracker = target_page->local_tracker();
         if (tracker == nullptr) {
           target_page->AllocateLocalTracker();
           tracker = target_page->local_tracker();
         }
         DCHECK_NOT_NULL(tracker);
-        const size_t size = NumberToSize(new_buffer->byte_length());
-        moved_size += size;
-        tracker->Add(new_buffer, size);
+        const size_t length = PerIsolateAccountingLength(old_buffer);
+        // We should decrement before adding to avoid potential overflows in
+        // the external memory counters.
+        tracker->AddInternal(new_buffer, std::move(it->second));
+        MemoryChunk::MoveExternalBackingStoreBytes(
+            ExternalBackingStoreType::kArrayBuffer,
+            static_cast<MemoryChunk*>(page_),
+            static_cast<MemoryChunk*>(target_page), length);
       }
-      it = array_buffers_.erase(it);
     } else if (result == kRemoveEntry) {
-      // Size of freed memory is computed to avoid looking at dead objects.
-      void* allocation_base = old_buffer->allocation_base();
-      DCHECK_NOT_NULL(allocation_base);
-
-      backing_stores_to_free->emplace_back(allocation_base,
-                                           old_buffer->allocation_length(),
-                                           old_buffer->allocation_mode());
-      it = array_buffers_.erase(it);
+      freed_memory += PerIsolateAccountingLength(old_buffer);
+      auto backing_store = std::move(it->second);
+      TRACE_BS("ABT:queue bs=%p mem=%p (length=%zu) cnt=%ld\n",
+               backing_store.get(), backing_store->buffer_start(),
+               backing_store->byte_length(), backing_store.use_count());
+      if (!backing_store->is_shared()) {
+        // Only retain non-shared backing stores. For shared backing stores,
+        // drop the shared_ptr right away, since this should be cheap,
+        // as it only updates a refcount, except that last, which will
+        // destruct it, which is rare.
+        backing_stores_to_free.push_back(backing_store);
+      }
     } else {
       UNREACHABLE();
     }
   }
-  const size_t freed_memory = retained_size_ - new_retained_size - moved_size;
-  if (freed_memory > 0) {
-    heap_->update_external_memory_concurrently_freed(
-        static_cast<intptr_t>(freed_memory));
+  if (freed_memory) {
+    page_->DecrementExternalBackingStoreBytes(
+        ExternalBackingStoreType::kArrayBuffer, freed_memory);
+    // TODO(wez): Remove backing-store from external memory accounting.
+    page_->heap()->update_external_memory_concurrently_freed(freed_memory);
   }
-  retained_size_ = new_retained_size;
 
-  // Pass the backing stores that need to be freed to the main thread for later
-  // distribution.
-  // ArrayBufferCollector takes ownership of this pointer.
-  heap_->array_buffer_collector()->AddGarbageAllocations(
-      backing_stores_to_free);
+  array_buffers_.swap(kept_array_buffers);
+
+  // Pass the backing stores that need to be freed to the main thread for
+  // potential later distribution.
+  page_->heap()->array_buffer_collector()->QueueOrFreeGarbageAllocations(
+      std::move(backing_stores_to_free));
 }
 
 void ArrayBufferTracker::PrepareToFreeDeadInNewSpace(Heap* heap) {
   DCHECK_EQ(heap->gc_state(), Heap::HeapState::SCAVENGE);
-  for (Page* page : PageRange(heap->new_space()->FromSpaceStart(),
-                              heap->new_space()->FromSpaceEnd())) {
+  for (Page* page :
+       PageRange(heap->new_space()->from_space().first_page(), nullptr)) {
     bool empty = ProcessBuffers(page, kUpdateForwardedRemoveOthers);
     CHECK(empty);
   }
 }
 
-size_t ArrayBufferTracker::RetainedInNewSpace(Heap* heap) {
-  size_t retained_size = 0;
-  for (Page* page : PageRange(heap->new_space()->ToSpaceStart(),
-                              heap->new_space()->ToSpaceEnd())) {
-    LocalArrayBufferTracker* tracker = page->local_tracker();
-    if (tracker == nullptr) continue;
-    retained_size += tracker->retained_size();
-  }
-  return retained_size;
-}
-
 void ArrayBufferTracker::FreeAll(Page* page) {
   LocalArrayBufferTracker* tracker = page->local_tracker();
   if (tracker == nullptr) return;
-  tracker->Free([](JSArrayBuffer* buffer) { return true; });
+  tracker->Free([](JSArrayBuffer buffer) { return true; });
   if (tracker->IsEmpty()) {
     page->ReleaseLocalTracker();
   }
@@ -111,29 +114,49 @@ bool ArrayBufferTracker::ProcessBuffers(Page* page, ProcessingMode mode) {
   if (tracker == nullptr) return true;
 
   DCHECK(page->SweepingDone());
-  tracker->Process(
-      [mode](JSArrayBuffer* old_buffer, JSArrayBuffer** new_buffer) {
-        MapWord map_word = old_buffer->map_word();
-        if (map_word.IsForwardingAddress()) {
-          *new_buffer = JSArrayBuffer::cast(map_word.ToForwardingAddress());
-          return LocalArrayBufferTracker::kUpdateEntry;
-        }
-        return mode == kUpdateForwardedKeepOthers
-                   ? LocalArrayBufferTracker::kKeepEntry
-                   : LocalArrayBufferTracker::kRemoveEntry;
-      });
+  tracker->Process([mode](JSArrayBuffer old_buffer, JSArrayBuffer* new_buffer) {
+    MapWord map_word = old_buffer.map_word();
+    if (map_word.IsForwardingAddress()) {
+      *new_buffer = JSArrayBuffer::cast(map_word.ToForwardingAddress());
+      return LocalArrayBufferTracker::kUpdateEntry;
+    }
+    return mode == kUpdateForwardedKeepOthers
+               ? LocalArrayBufferTracker::kKeepEntry
+               : LocalArrayBufferTracker::kRemoveEntry;
+  });
   return tracker->IsEmpty();
 }
 
-bool ArrayBufferTracker::IsTracked(JSArrayBuffer* buffer) {
-  Page* page = Page::FromAddress(buffer->address());
+bool ArrayBufferTracker::IsTracked(JSArrayBuffer buffer) {
+  Page* page = Page::FromHeapObject(buffer);
   {
-    base::LockGuard<base::Mutex> guard(page->mutex());
+    base::MutexGuard guard(page->mutex());
     LocalArrayBufferTracker* tracker = page->local_tracker();
     if (tracker == nullptr) return false;
     return tracker->IsTracked(buffer);
   }
 }
 
+void ArrayBufferTracker::TearDown(Heap* heap) {
+  // ArrayBuffers can only be found in NEW_SPACE and OLD_SPACE.
+  for (Page* p : *heap->old_space()) {
+    FreeAll(p);
+  }
+  NewSpace* new_space = heap->new_space();
+  if (new_space->to_space().is_committed()) {
+    for (Page* p : new_space->to_space()) {
+      FreeAll(p);
+    }
+  }
+#ifdef DEBUG
+  if (new_space->from_space().is_committed()) {
+    for (Page* p : new_space->from_space()) {
+      DCHECK(!p->contains_array_buffers());
+    }
+  }
+#endif  // DEBUG
+}
+
 }  // namespace internal
 }  // namespace v8
+#undef TRACE_BS

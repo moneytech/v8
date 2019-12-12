@@ -44,6 +44,9 @@ local FLAGS = {
    -- TODO add some sort of whiteliste to filter out false positives.
    dead_vars = false;
 
+   -- Enable verbose tracing from the plugin itself.
+   verbose_trace = false;
+
    -- When building gcsuspects whitelist certain functions as if they
    -- can be causing GC. Currently used to reduce number of false
    -- positives in dead variables analysis. See TODO for WHITELIST
@@ -102,16 +105,18 @@ local function MakeClangCommandLine(
      end
      plugin_args = " " .. table.concat(plugin_args, " ")
    end
-   return CLANG_BIN .. "/clang++ -std=c++11 -c "
+   return CLANG_BIN .. "/clang++ -std=c++14 -c"
       .. " -Xclang -load -Xclang " .. CLANG_PLUGINS .. "/libgcmole.so"
       .. " -Xclang -plugin -Xclang "  .. plugin
       .. (plugin_args or "")
       .. " -Xclang -triple -Xclang " .. triple
+      .. " -fno-exceptions"
       .. " -D" .. arch_define
       .. " -DENABLE_DEBUGGER_SUPPORT"
       .. " -DV8_INTL_SUPPORT"
       .. " -I./"
       .. " -Iinclude/"
+      .. " -Iout/Release/gen"
       .. " -Ithird_party/icu/source/common"
       .. " -Ithird_party/icu/source/i18n"
       .. " " .. arch_options
@@ -181,41 +186,20 @@ function InvokeClangPluginForEachFile(filenames, cfg, func)
 end
 
 -------------------------------------------------------------------------------
--- GYP file parsing
 
--- TODO(machenbach): Remove this when deprecating gyp.
-local function ParseGYPFile()
+local function ParseGNFile(for_test)
    local result = {}
-   local gyp_files = {
-       { "src/v8.gyp",             "'([^']-%.cc)'",      "src/"         },
-       { "test/cctest/cctest.gyp", "'(test-[^']-%.cc)'", "test/cctest/" }
-   }
-
-   for i = 1, #gyp_files do
-      local filename = gyp_files[i][1]
-      local pattern = gyp_files[i][2]
-      local prefix = gyp_files[i][3]
-      local gyp_file = assert(io.open(filename), "failed to open GYP file")
-      local gyp = gyp_file:read('*a')
-      for condition, sources in
-         gyp:gmatch "%[.-### gcmole%((.-)%) ###(.-)%]" do
-         if result[condition] == nil then result[condition] = {} end
-         for file in sources:gmatch(pattern) do
-            table.insert(result[condition], prefix .. file)
-         end
-      end
-      gyp_file:close()
+   local gn_files
+   if for_test then
+      gn_files = {
+         { "tools/gcmole/GCMOLE.gn",             '"([^"]-%.cc)"',      ""         }
+      }
+   else
+      gn_files = {
+         { "BUILD.gn",             '"([^"]-%.cc)"',      ""         },
+         { "test/cctest/BUILD.gn", '"(test-[^"]-%.cc)"', "test/cctest/" }
+      }
    end
-
-   return result
-end
-
-local function ParseGNFile()
-   local result = {}
-   local gn_files = {
-       { "BUILD.gn",             '"([^"]-%.cc)"',      ""         },
-       { "test/cctest/BUILD.gn", '"(test-[^"]-%.cc)"', "test/cctest/" }
-   }
 
    for i = 1, #gn_files do
       local filename = gn_files[i][1]
@@ -258,36 +242,18 @@ local function BuildFileList(sources, props)
 end
 
 
-local gyp_sources = ParseGYPFile()
-local gn_sources = ParseGNFile()
-
--- TODO(machenbach): Remove this comparison logic when deprecating gyp.
-local function CompareSources(sources1, sources2, what)
-  for condition, files1 in pairs(sources1) do
-    local files2 = sources2[condition]
-    assert(
-      files2 ~= nil,
-      "Missing gcmole condition in " .. what .. ": " .. condition)
-
-    -- Turn into set for speed.
-    files2_set = {}
-    for i, file in pairs(files2) do files2_set[file] = true end
-
-    for i, file in pairs(files1) do
-      assert(
-        files2_set[file] ~= nil,
-        "Missing file " .. file .. " in " .. what .. " for condition " ..
-        condition)
-    end
-  end
-end
-
-CompareSources(gyp_sources, gn_sources, "GN")
-CompareSources(gn_sources, gyp_sources, "GYP")
-
+local gn_sources = ParseGNFile(false)
+local gn_test_sources = ParseGNFile(true)
 
 local function FilesForArch(arch)
    return BuildFileList(gn_sources, { os = 'linux',
+                                      arch = arch,
+                                      mode = 'debug',
+                                      simulator = ''})
+end
+
+local function FilesForTest(arch)
+   return BuildFileList(gn_test_sources, { os = 'linux',
                                       arch = arch,
                                       mode = 'debug',
                                       simulator = ''})
@@ -347,7 +313,10 @@ local WHITELIST = {
    "StateTag",
 
    -- Ignore printing of elements transition.
-   "PrintElementsTransition"
+   "PrintElementsTransition",
+
+   -- CodeCreateEvent receives AbstractCode (a raw ptr) as an argument.
+   "CodeCreateEvent",
 };
 
 local function AddCause(name, cause)
@@ -446,8 +415,13 @@ end
 --------------------------------------------------------------------------------
 -- Analysis
 
-local function CheckCorrectnessForArch(arch)
-   local files = FilesForArch(arch)
+local function CheckCorrectnessForArch(arch, for_test)
+   local files
+   if for_test then
+      files = FilesForTest(arch)
+   else
+      files = FilesForArch(arch)
+   end
    local cfg = ARCHITECTURES[arch]
 
    if not FLAGS.reuse_gcsuspects then
@@ -456,6 +430,7 @@ local function CheckCorrectnessForArch(arch)
 
    local processed_files = 0
    local errors_found = false
+   local output = ""
    local function SearchForErrors(filename, lines)
       processed_files = processed_files + 1
       for l in lines do
@@ -463,15 +438,20 @@ local function CheckCorrectnessForArch(arch)
             l:match "^[^:]+:%d+:%d+:" or
             l:match "error" or
             l:match "warning"
-         print(l)
+         if for_test then
+            output = output.."\n"..l
+         else
+            print(l)
+         end
       end
    end
 
    log("** Searching for evaluation order problems%s for %s",
        FLAGS.dead_vars and " and dead variables" or "",
        arch)
-   local plugin_args
-   if FLAGS.dead_vars then plugin_args = { "--dead-vars" } end
+   local plugin_args = {}
+   if FLAGS.dead_vars then table.insert(plugin_args, "--dead-vars") end
+   if FLAGS.verbose_trace then table.insert(plugin_args, '--verbose') end
    InvokeClangPluginForEachFile(files,
                                 cfg:extend { plugin = "find-problems",
                                              plugin_args = plugin_args },
@@ -480,26 +460,47 @@ local function CheckCorrectnessForArch(arch)
        processed_files,
        errors_found and "Errors found" or "No errors found")
 
-   return errors_found
+   return errors_found, output
 end
 
-local function SafeCheckCorrectnessForArch(arch)
-   local status, errors = pcall(CheckCorrectnessForArch, arch)
+local function SafeCheckCorrectnessForArch(arch, for_test)
+   local status, errors, output = pcall(CheckCorrectnessForArch, arch, for_test)
    if not status then
       print(string.format("There was an error: %s", errors))
       errors = true
    end
-   return errors
+   return errors, output
 end
 
-local errors = false
+local function TestRun()
+   local errors, output = SafeCheckCorrectnessForArch('x64', true)
+   if not errors then
+      log("** Test file should produce errors, but none were found. Output:")
+      log(output)
+      return false
+   end
+
+   local filename = "tools/gcmole/test-expectations.txt"
+   local exp_file = assert(io.open(filename), "failed to open test expectations file")
+   local expectations = exp_file:read('*all')
+
+   if output ~= expectations then
+      log("** Output mismatch from running tests. Please run them manually.")
+      return false
+   end
+
+   log("** Tests ran successfully")
+   return true
+end
+
+local errors = not TestRun()
 
 for _, arch in ipairs(ARCHS) do
    if not ARCHITECTURES[arch] then
-      error ("Unknown arch: " .. arch)
+      error("Unknown arch: " .. arch)
    end
 
-   errors = SafeCheckCorrectnessForArch(arch, report) or errors
+   errors = SafeCheckCorrectnessForArch(arch, false) or errors
 end
 
 os.exit(errors and 1 or 0)

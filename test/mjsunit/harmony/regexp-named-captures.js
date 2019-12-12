@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --harmony-regexp-named-captures --allow-natives-syntax
+// Flags: --allow-natives-syntax
 
 // Malformed named captures.
 assertThrows("/(?<>a)/u", SyntaxError);  // Empty name.
@@ -419,13 +419,22 @@ function toSlowMode(re) {
   assertEquals("cd", "abcd".replace(re, "$<$1>"));
 }
 
+// Named captures are ordered by capture index on the groups object.
+// https://crbug.com/v8/9822
+
+{
+  const r = /(?<BKey>.+)\s(?<AKey>.+)/;
+  const s = 'example string';
+  assertArrayEquals(["BKey", "AKey"], Object.keys(r.exec(s).groups));
+}
+
 // Tests for 'groups' semantics on the regexp result object.
 // https://crbug.com/v8/7192
 
 {
   const re = /./;
   const result = re.exec("a");
-  assertTrue(%SpeciesProtector());
+  assertTrue(%ArraySpeciesProtector());
   assertEquals(result.__proto__, Array.prototype);
   assertTrue(result.hasOwnProperty('groups'));
   assertArrayEquals(["a"], result);
@@ -433,7 +442,7 @@ function toSlowMode(re) {
   assertEquals(undefined, result.groups);
 
   Array.prototype.groups = { a: "b" };
-  assertTrue(%SpeciesProtector());
+  assertTrue(%ArraySpeciesProtector());
   assertEquals("$<a>", "a".replace(re, "$<a>"));
   Array.prototype.groups = undefined;
 }
@@ -441,7 +450,7 @@ function toSlowMode(re) {
 {
   const re = toSlowMode(/./);
   const result = re.exec("a");
-  assertTrue(%SpeciesProtector());
+  assertTrue(%ArraySpeciesProtector());
   assertEquals(result.__proto__, Array.prototype);
   assertTrue(result.hasOwnProperty('groups'));
   assertArrayEquals(["a"], result);
@@ -449,7 +458,7 @@ function toSlowMode(re) {
   assertEquals(undefined, result.groups);
 
   Array.prototype.groups = { a: "b" };
-  assertTrue(%SpeciesProtector());
+  assertTrue(%ArraySpeciesProtector());
   assertEquals("$<a>", "a".replace(re, "$<a>"));
   Array.prototype.groups = undefined;
 }
@@ -457,7 +466,7 @@ function toSlowMode(re) {
 {
   const re = /(?<a>a).|(?<x>x)/;
   const result = re.exec("ab");
-  assertTrue(%SpeciesProtector());
+  assertTrue(%ArraySpeciesProtector());
   assertEquals(result.__proto__, Array.prototype);
   assertTrue(result.hasOwnProperty('groups'));
   assertArrayEquals(["ab", "a", undefined], result);
@@ -467,7 +476,7 @@ function toSlowMode(re) {
   // a is a matched named capture, b is an unmatched named capture, and z
   // is not a named capture.
   Array.prototype.groups = { a: "b", x: "y", z: "z" };
-  assertTrue(%SpeciesProtector());
+  assertTrue(%ArraySpeciesProtector());
   assertEquals("a", "ab".replace(re, "$<a>"));
   assertEquals("", "ab".replace(re, "$<x>"));
   assertEquals("", "ab".replace(re, "$<z>"));
@@ -477,7 +486,7 @@ function toSlowMode(re) {
 {
   const re = toSlowMode(/(?<a>a).|(?<x>x)/);
   const result = re.exec("ab");
-  assertTrue(%SpeciesProtector());
+  assertTrue(%ArraySpeciesProtector());
   assertEquals(result.__proto__, Array.prototype);
   assertTrue(result.hasOwnProperty('groups'));
   assertArrayEquals(["ab", "a", undefined], result);
@@ -487,7 +496,7 @@ function toSlowMode(re) {
   // a is a matched named capture, b is an unmatched named capture, and z
   // is not a named capture.
   Array.prototype.groups = { a: "b", x: "y", z: "z" };
-  assertTrue(%SpeciesProtector());
+  assertTrue(%ArraySpeciesProtector());
   assertEquals("a", "ab".replace(re, "$<a>"));
   assertEquals("", "ab".replace(re, "$<x>"));
   assertEquals("", "ab".replace(re, "$<z>"));
@@ -506,13 +515,13 @@ function toSlowMode(re) {
 
   const re = new FakeRegExp();
   const result = re.exec("ab");
-  assertTrue(%SpeciesProtector());
+  assertTrue(%ArraySpeciesProtector());
   assertEquals(result.__proto__, Array.prototype);
   assertFalse(result.hasOwnProperty('groups'));
 
   Array.prototype.groups = { a: "b" };
   Array.prototype.groups.__proto__.b = "c";
-  assertTrue(%SpeciesProtector());
+  assertTrue(%ArraySpeciesProtector());
   assertEquals("b", "ab".replace(re, "$<a>"));
   assertEquals("c", "ab".replace(re, "$<b>"));
   Array.prototype.groups = undefined;
@@ -531,7 +540,7 @@ function toSlowMode(re) {
 
   const re = new FakeRegExp();
   const result = re.exec("ab");
-  assertTrue(%SpeciesProtector());
+  assertTrue(%ArraySpeciesProtector());
   assertEquals(result.__proto__, Array.prototype);
   assertTrue(result.hasOwnProperty('groups'));
   assertEquals({ a: "b" }, result.groups);

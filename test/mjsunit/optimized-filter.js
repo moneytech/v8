@@ -23,7 +23,8 @@
       return true;
     }
     return a.filter(callback);
-  }
+  };
+  %PrepareFunctionForOptimization(eagerDeoptInCalled);
   eagerDeoptInCalled();
   eagerDeoptInCalled();
   %OptimizeFunctionOnNextCall(eagerDeoptInCalled);
@@ -43,7 +44,8 @@
       return i == 0 ? false : true;
     }
     return a.filter(callback);
-  }
+  };
+  %PrepareFunctionForOptimization(eagerDeoptInCalled);
   var like_a = [1,2,3,4,5,6,7,8,9,10];
   assertEquals(like_a.slice(1), eagerDeoptInCalled());
   eagerDeoptInCalled();
@@ -66,7 +68,8 @@
       return true;
     }
     return a.filter(callback);
-  }
+  };
+  %PrepareFunctionForOptimization(lazyChanger);
   assertEquals(a, lazyChanger());
   lazyChanger();
   %OptimizeFunctionOnNextCall(lazyChanger);
@@ -88,7 +91,8 @@
       return true;
     }
     return a.filter(callback);
-  }
+  };
+  %PrepareFunctionForOptimization(lazyDeselection);
   assertEquals(a, lazyDeselection());
   lazyDeselection();
   %OptimizeFunctionOnNextCall(lazyDeselection);
@@ -111,7 +115,8 @@
       return true;
     }
     a_noescape.filter(callback);
-  }
+  };
+  %PrepareFunctionForOptimization(eagerDeoptInCalled);
   eagerDeoptInCalled();
   eagerDeoptInCalled();
   %OptimizeFunctionOnNextCall(eagerDeoptInCalled);
@@ -138,7 +143,8 @@
     };
     %NeverOptimizeFunction(callback);
     b.filter(callback);
-  }
+  };
+  %PrepareFunctionForOptimization(lazyDeopt);
   lazyDeopt();
   lazyDeopt();
   %OptimizeFunctionOnNextCall(lazyDeopt);
@@ -160,7 +166,8 @@
       return true;
     }
     a.filter(callback);
-  }
+  };
+  %PrepareFunctionForOptimization(lazyDeopt);
   lazyDeopt();
   lazyDeopt();
   %OptimizeFunctionOnNextCall(lazyDeopt);
@@ -184,7 +191,8 @@
     };
     %NeverOptimizeFunction(callback);
     a.filter(callback);
-  }
+  };
+  %PrepareFunctionForOptimization(lazyDeopt);
   lazyDeopt();
   lazyDeopt();
   %OptimizeFunctionOnNextCall(lazyDeopt);
@@ -209,7 +217,8 @@
       return true;
     }
     a.filter(callback);
-  }
+  };
+  %PrepareFunctionForOptimization(lazyDeopt);
   lazyDeopt();
   lazyDeopt();
   %OptimizeFunctionOnNextCall(lazyDeopt);
@@ -238,7 +247,8 @@
     } catch (e) {
       caught = true;
     }
-  }
+  };
+  %PrepareFunctionForOptimization(lazyDeopt);
   lazyDeopt();
   lazyDeopt();
   %OptimizeFunctionOnNextCall(lazyDeopt);
@@ -268,7 +278,8 @@
     } catch (e) {
       caught = true;
     }
-  }
+  };
+  %PrepareFunctionForOptimization(lazyDeopt);
   lazyDeopt();
   lazyDeopt();
   %OptimizeFunctionOnNextCall(lazyDeopt);
@@ -299,7 +310,8 @@
       result = "nope";
     }
     return result;
-  }
+  };
+  %PrepareFunctionForOptimization(lazyDeopt);
   assertEquals([1,2,3,4], lazyDeopt(false));
   assertEquals([1,2,3,4], lazyDeopt(false));
   assertEquals("nope", lazyDeopt(true));
@@ -326,7 +338,8 @@
     };
     var o = [1,2,3];
     b.filter(callback);
-  }
+  };
+  %PrepareFunctionForOptimization(lazyDeopt);
   lazyDeopt();
   lazyDeopt();
   %OptimizeFunctionOnNextCall(lazyDeopt);
@@ -351,7 +364,8 @@
     %NeverOptimizeFunction(callback);
     var o = [1,2,3];
     b.filter(callback);
-  }
+  };
+  %PrepareFunctionForOptimization(lazyDeopt);
   lazyDeopt();
   lazyDeopt();
   %OptimizeFunctionOnNextCall(lazyDeopt);
@@ -377,7 +391,8 @@
     };
     var o = [1,2,3];
     b.filter(callback);
-  }
+  };
+  %PrepareFunctionForOptimization(lazyDeopt);
   lazyDeopt();
   lazyDeopt();
   %OptimizeFunctionOnNextCall(lazyDeopt);
@@ -401,7 +416,8 @@
       return true;
     };
     a.filter(callback);
-  }
+  };
+  %PrepareFunctionForOptimization(lazyDeopt);
   assertThrows(() => lazyDeopt());
   assertThrows(() => lazyDeopt());
   try {
@@ -417,6 +433,62 @@
   }
 })();
 
+// Verify holes are skipped.
+(() => {
+  const a = [1, 2, , 3, 4];
+  let callback_values = [];
+  function withHoles() {
+    callback_values = [];
+    return a.filter(v => {
+      callback_values.push(v);
+      return true;
+    });
+  }
+  %PrepareFunctionForOptimization(withHoles);
+  withHoles();
+  withHoles();
+  %OptimizeFunctionOnNextCall(withHoles);
+  assertArrayEquals([1, 2, 3, 4], withHoles());
+  assertArrayEquals([1, 2, 3, 4], callback_values);
+})();
+
+(() => {
+  const a = [1.5, 2.5, , 3.5, 4.5];
+  let callback_values = [];
+  function withHoles() {
+    callback_values = [];
+    return a.filter(v => {
+      callback_values.push(v);
+      return true;
+    });
+  }
+  %PrepareFunctionForOptimization(withHoles);
+  withHoles();
+  withHoles();
+  %OptimizeFunctionOnNextCall(withHoles);
+  assertArrayEquals([1.5, 2.5, 3.5, 4.5], withHoles());
+  assertArrayEquals([1.5, 2.5, 3.5, 4.5], callback_values);
+})();
+
+// Ensure that we handle side-effects between load and call.
+(() => {
+  function side_effect(a, b) { if (b) a.foo = 3; return a; }
+  %NeverOptimizeFunction(side_effect);
+
+  function unreliable(a, b) {
+    return a.filter(x => x % 2 === 0, side_effect(a, b));
+  }
+
+  %PrepareFunctionForOptimization(unreliable);
+  let a = [1, 2, 3];
+  unreliable(a, false);
+  unreliable(a, false);
+  %OptimizeFunctionOnNextCall(unreliable);
+  unreliable(a, false);
+  // Now actually do change the map.
+  unreliable(a, true);
+})();
+
 // Messing with the Array species constructor causes deoptimization.
 (function() {
   var result = 0;
@@ -427,7 +499,8 @@
       return true;
     }
     a.filter(callback);
-  }
+  };
+  %PrepareFunctionForOptimization(species_breakage);
   species_breakage();
   species_breakage();
   %OptimizeFunctionOnNextCall(species_breakage);

@@ -25,6 +25,8 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+# for py2/py3 compatibility
+from __future__ import print_function
 
 import sys
 import time
@@ -38,47 +40,50 @@ REPORT_TEMPLATE = (
  * %(nocrash)4d tests are expected to be flaky but not crash
  * %(pass)4d tests are expected to pass
  * %(fail_ok)4d tests are expected to fail that we won't fix
- * %(fail)4d tests are expected to fail that we should fix""")
+ * %(fail)4d tests are expected to fail that we should fix
+ * %(crash)4d tests are expected to crash
+""")
 
 
+# TODO(majeski): Turn it into an observer.
 def PrintReport(tests):
   total = len(tests)
-  skipped = nocrash = passes = fail_ok = fail = 0
+  skipped = nocrash = passes = fail_ok = fail = crash = 0
   for t in tests:
-    outcomes = t.suite.GetStatusFileOutcomes(t.name, t.variant)
-    if not outcomes:
-      passes += 1
-      continue
-    if statusfile.DoSkip(outcomes):
+    if t.do_skip:
       skipped += 1
-      continue
-    if statusfile.IsPassOrFail(outcomes):
+    elif t.is_pass_or_fail:
       nocrash += 1
-    if list(outcomes) == [statusfile.PASS]:
-      passes += 1
-    if statusfile.IsFailOk(outcomes):
+    elif t.is_fail_ok:
       fail_ok += 1
-    if statusfile.FAIL in outcomes and statusfile.PASS not in outcomes:
+    elif t.expected_outcomes == [statusfile.PASS]:
+      passes += 1
+    elif t.expected_outcomes == [statusfile.FAIL]:
       fail += 1
+    elif t.expected_outcomes == [statusfile.CRASH]:
+      crash += 1
+    else:
+      assert False # Unreachable # TODO: check this in outcomes parsing phase.
 
-  print REPORT_TEMPLATE % {
+  print(REPORT_TEMPLATE % {
     "total": total,
     "skipped": skipped,
     "nocrash": nocrash,
     "pass": passes,
     "fail_ok": fail_ok,
-    "fail": fail
-  }
+    "fail": fail,
+    "crash": crash,
+  })
 
 
 def PrintTestSource(tests):
   for test in tests:
-    print "--- begin source: %s ---" % test
+    print("--- begin source: %s ---" % test)
     if test.is_source_available():
-      print test.get_source()
+      print(test.get_source())
     else:
-      print '(no source available)'
-    print "--- end source: %s ---" % test
+      print('(no source available)')
+    print("--- end source: %s ---" % test)
 
 
 def FormatTime(d):
@@ -89,11 +94,11 @@ def FormatTime(d):
 def PrintTestDurations(suites, outputs, overall_time):
     # Write the times to stderr to make it easy to separate from the
     # test output.
-    print
+    print()
     sys.stderr.write("--- Total time: %s ---\n" % FormatTime(overall_time))
     timed_tests = [(t, outputs[t].duration) for s in suites for t in s.tests
                    if t in outputs]
-    timed_tests.sort(key=lambda (_, duration): duration, reverse=True)
+    timed_tests.sort(key=lambda test_duration: test_duration[1], reverse=True)
     index = 1
     for test, duration in timed_tests[:20]:
       t = FormatTime(duration)

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "src/compiler/gap-resolver.h"
+#include "src/compiler/backend/gap-resolver.h"
 
 #include "src/base/utils/random-number-generator.h"
 #include "test/cctest/cctest.h"
@@ -110,8 +110,8 @@ class InterpreterState {
   };
 
   // Internally, the state is a normalized permutation of Value pairs.
-  typedef Key Value;
-  typedef std::map<Key, Value> OperandMap;
+  using Value = Key;
+  using OperandMap = std::map<Key, Value>;
 
   Value read(const InstructionOperand& op) const {
     OperandMap::const_iterator it = values_.find(KeyFor(op));
@@ -165,14 +165,12 @@ class InterpreterState {
 
   friend std::ostream& operator<<(std::ostream& os,
                                   const InterpreterState& is) {
-    for (OperandMap::const_iterator it = is.values_.begin();
-         it != is.values_.end(); ++it) {
-      if (it != is.values_.begin()) os << " ";
-      InstructionOperand source = FromKey(it->second);
-      InstructionOperand destination = FromKey(it->first);
-      MoveOperands mo(source, destination);
-      PrintableMoveOperands pmo = {GetRegConfig(), &mo};
-      os << pmo;
+    const char* space = "";
+    for (auto& value : is.values_) {
+      InstructionOperand source = FromKey(value.second);
+      InstructionOperand destination = FromKey(value.first);
+      os << space << MoveOperands{source, destination};
+      space = " ";
     }
     return os;
   }
@@ -314,9 +312,9 @@ class ParallelMoveCreator : public HandleAndZoneScope {
     UNREACHABLE();
   }
 
-  // min(num_alloctable_general_registers for each arch) == 6 from
+  // min(num_alloctable_general_registers for each arch) == 5 from
   // assembler-ia32.h
-  const int kMaxIndex = 6;
+  const int kMaxIndex = 5;
   const int kMaxIndices = kMaxIndex + 1;
 
   // Non-FP slots shouldn't overlap FP slots.
@@ -355,7 +353,7 @@ class ParallelMoveCreator : public HandleAndZoneScope {
     };
     int index = rng_->NextInt(kMaxIndex);
     // destination can't be Constant.
-    switch (rng_->NextInt(is_source ? 5 : 4)) {
+    switch (rng_->NextInt(is_source ? 3 : 2)) {
       case 0:
         return AllocatedOperand(LocationOperand::STACK_SLOT, rep,
                                 GetValidSlotIndex(rep, index));
@@ -363,12 +361,6 @@ class ParallelMoveCreator : public HandleAndZoneScope {
         return AllocatedOperand(LocationOperand::REGISTER, rep,
                                 GetValidRegisterCode(rep, index));
       case 2:
-        return ExplicitOperand(LocationOperand::REGISTER, rep,
-                               GetValidRegisterCode(rep, 1));
-      case 3:
-        return ExplicitOperand(LocationOperand::STACK_SLOT, rep,
-                               GetValidSlotIndex(rep, index));
-      case 4:
         return ConstantOperand(index);
     }
     UNREACHABLE();

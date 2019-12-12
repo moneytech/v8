@@ -4,7 +4,6 @@
 
 // Flags: --expose-wasm --wasm-interpret-all
 
-load('test/mjsunit/wasm/wasm-constants.js');
 load('test/mjsunit/wasm/wasm-module-builder.js');
 
 assertThrows(() => {
@@ -26,7 +25,7 @@ function __f_1() {
  __v_21 = __f_1(__v_18 = false, __v_25 = kSig_i_i);
  __v_21.addFunction('plus_one', kSig_i_i)
       .addBody([
-        kExprGetLocal, 0,                   // -
+        kExprLocalGet, 0,                   // -
         kExprCallFunction, __v_29      ])
       .exportFunc();
  __v_32 =

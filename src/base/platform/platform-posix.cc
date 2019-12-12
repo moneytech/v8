@@ -18,7 +18,6 @@
 #include <unistd.h>
 
 #include <sys/mman.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -44,15 +43,22 @@
 #include "src/base/utils/random-number-generator.h"
 
 #ifdef V8_FAST_TLS_SUPPORTED
-#include "src/base/atomicops.h"
+#include <atomic>
 #endif
 
 #if V8_OS_MACOSX
 #include <dlfcn.h>
+#include <mach/mach.h>
 #endif
 
 #if V8_OS_LINUX
 #include <sys/prctl.h>  // NOLINT, for prctl
+#endif
+
+#if defined(V8_OS_FUCHSIA)
+#include <zircon/process.h>
+#else
+#include <sys/resource.h>
 #endif
 
 #if !defined(_AIX) && !defined(V8_OS_FUCHSIA)
@@ -81,14 +87,15 @@ namespace base {
 namespace {
 
 // 0 is never a valid thread id.
-const pthread_t kNoThread = (pthread_t) 0;
+const pthread_t kNoThread = static_cast<pthread_t>(0);
 
 bool g_hard_abort = false;
 
 const char* g_gc_fake_mmap = nullptr;
 
-static LazyInstance<RandomNumberGenerator>::type
-    platform_random_number_generator = LAZY_INSTANCE_INITIALIZER;
+DEFINE_LAZY_LEAKY_OBJECT_GETTER(RandomNumberGenerator,
+                                GetPlatformRandomNumberGenerator)
+static LazyMutex rng_mutex = LAZY_MUTEX_INITIALIZER;
 
 #if !V8_OS_FUCHSIA
 #if V8_OS_MACOSX
@@ -106,6 +113,8 @@ int GetProtectionFromMemoryPermission(OS::MemoryPermission access) {
   switch (access) {
     case OS::MemoryPermission::kNoAccess:
       return PROT_NONE;
+    case OS::MemoryPermission::kRead:
+      return PROT_READ;
     case OS::MemoryPermission::kReadWrite:
       return PROT_READ | PROT_WRITE;
     case OS::MemoryPermission::kReadWriteExecute:
@@ -129,47 +138,63 @@ int GetFlagsForMemoryPermission(OS::MemoryPermission access) {
   return flags;
 }
 
-void* Allocate(void* address, size_t size, OS::MemoryPermission access) {
+void* Allocate(void* hint, size_t size, OS::MemoryPermission access) {
   int prot = GetProtectionFromMemoryPermission(access);
   int flags = GetFlagsForMemoryPermission(access);
-  void* result = mmap(address, size, prot, flags, kMmapFd, kMmapFdOffset);
+  void* result = mmap(hint, size, prot, flags, kMmapFd, kMmapFdOffset);
   if (result == MAP_FAILED) return nullptr;
   return result;
-}
-
-int ReclaimInaccessibleMemory(void* address, size_t size) {
-#if defined(OS_MACOSX)
-  // On OSX, MADV_FREE_REUSABLE has comparable behavior to MADV_FREE, but also
-  // marks the pages with the reusable bit, which allows both Activity Monitor
-  // and memory-infra to correctly track the pages.
-  int ret = madvise(address, size, MADV_FREE_REUSABLE);
-#elif defined(_AIX) || defined(V8_OS_SOLARIS)
-  int ret = madvise(reinterpret_cast<caddr_t>(address), size, MADV_FREE);
-#else
-  int ret = madvise(address, size, MADV_FREE);
-#endif
-  if (ret != 0 && errno == EINVAL) {
-    // MADV_FREE only works on Linux 4.5+ . If request failed, retry with older
-    // MADV_DONTNEED . Note that MADV_FREE being defined at compile time doesn't
-    // imply runtime support.
-#if defined(_AIX) || defined(V8_OS_SOLARIS)
-    ret = madvise(reinterpret_cast<caddr_t>(address), size, MADV_DONTNEED);
-#else
-    ret = madvise(address, size, MADV_DONTNEED);
-#endif
-  }
-  return ret;
 }
 
 #endif  // !V8_OS_FUCHSIA
 
 }  // namespace
 
-void OS::Initialize(int64_t random_seed, bool hard_abort,
-                    const char* const gc_fake_mmap) {
-  if (random_seed) {
-    platform_random_number_generator.Pointer()->SetSeed(random_seed);
-  }
+#if V8_OS_LINUX || V8_OS_FREEBSD
+#ifdef __arm__
+
+bool OS::ArmUsingHardFloat() {
+  // GCC versions 4.6 and above define __ARM_PCS or __ARM_PCS_VFP to specify
+  // the Floating Point ABI used (PCS stands for Procedure Call Standard).
+  // We use these as well as a couple of other defines to statically determine
+  // what FP ABI used.
+  // GCC versions 4.4 and below don't support hard-fp.
+  // GCC versions 4.5 may support hard-fp without defining __ARM_PCS or
+  // __ARM_PCS_VFP.
+
+#define GCC_VERSION \
+  (__GNUC__ * 10000 + __GNUC_MINOR__ * 100 + __GNUC_PATCHLEVEL__)
+#if GCC_VERSION >= 40600 && !defined(__clang__)
+#if defined(__ARM_PCS_VFP)
+  return true;
+#else
+  return false;
+#endif
+
+#elif GCC_VERSION < 40500 && !defined(__clang__)
+  return false;
+
+#else
+#if defined(__ARM_PCS_VFP)
+  return true;
+#elif defined(__ARM_PCS) || defined(__SOFTFP__) || defined(__SOFTFP) || \
+    !defined(__VFP_FP__)
+  return false;
+#else
+#error \
+    "Your version of compiler does not report the FP ABI compiled for."     \
+       "Please report it on this issue"                                        \
+       "http://code.google.com/p/v8/issues/detail?id=2140"
+
+#endif
+#endif
+#undef GCC_VERSION
+}
+
+#endif  // def __arm__
+#endif
+
+void OS::Initialize(bool hard_abort, const char* const gc_fake_mmap) {
   g_hard_abort = hard_abort;
   g_gc_fake_mmap = gc_fake_mmap;
 }
@@ -205,15 +230,35 @@ size_t OS::CommitPageSize() {
 }
 
 // static
+void OS::SetRandomMmapSeed(int64_t seed) {
+  if (seed) {
+    MutexGuard guard(rng_mutex.Pointer());
+    GetPlatformRandomNumberGenerator()->SetSeed(seed);
+  }
+}
+
+// static
 void* OS::GetRandomMmapAddr() {
-#if defined(ADDRESS_SANITIZER) || defined(MEMORY_SANITIZER) || \
-    defined(THREAD_SANITIZER)
-  // Dynamic tools do not support custom mmap addresses.
-  return nullptr;
-#else
   uintptr_t raw_addr;
-  platform_random_number_generator.Pointer()->NextBytes(&raw_addr,
-                                                        sizeof(raw_addr));
+  {
+    MutexGuard guard(rng_mutex.Pointer());
+    GetPlatformRandomNumberGenerator()->NextBytes(&raw_addr, sizeof(raw_addr));
+  }
+#if defined(__APPLE__)
+#if V8_TARGET_ARCH_ARM64
+  DCHECK_EQ(1 << 14, AllocatePageSize());
+  raw_addr = RoundDown(raw_addr, 1 << 14);
+#endif
+#endif
+#if defined(V8_USE_ADDRESS_SANITIZER) || defined(MEMORY_SANITIZER) || \
+    defined(THREAD_SANITIZER) || defined(LEAK_SANITIZER)
+  // If random hint addresses interfere with address ranges hard coded in
+  // sanitizers, bad things happen. This address range is copied from TSAN
+  // source but works with all tools.
+  // See crbug.com/539863.
+  raw_addr &= 0x007fffff0000ULL;
+  raw_addr += 0x7e8000000000ULL;
+#else
 #if V8_TARGET_ARCH_X64
   // Currently available CPUs have 48 bits of virtual addressing.  Truncate
   // the hint address to 46 bits to give the kernel a fighting chance of
@@ -227,11 +272,11 @@ void* OS::GetRandomMmapAddr() {
   // Use extra address space to isolate the mmap regions.
   raw_addr += uint64_t{0x400000000000};
 #elif V8_TARGET_BIG_ENDIAN
-  // Big-endian Linux: 44 bits of virtual addressing.
+  // Big-endian Linux: 42 bits of virtual addressing.
   raw_addr &= uint64_t{0x03FFFFFFF000};
 #else
-  // Little-endian Linux: 48 bits of virtual addressing.
-  raw_addr &= uint64_t{0x3FFFFFFFF000};
+  // Little-endian Linux: 46 bits of virtual addressing.
+  raw_addr &= uint64_t{0x3FFFFFFF0000};
 #endif
 #elif V8_TARGET_ARCH_S390X
   // Linux on Z uses bits 22-32 for Region Indexing, which translates to 42 bits
@@ -242,6 +287,10 @@ void* OS::GetRandomMmapAddr() {
   // 31 bits of virtual addressing.  Truncate to 29 bits to allow kernel chance
   // to fulfill request.
   raw_addr &= 0x1FFFF000;
+#elif V8_TARGET_ARCH_MIPS64
+  // 42 bits of virtual addressing. Truncate to 40 bits to allow kernel chance
+  // to fulfill request.
+  raw_addr &= uint64_t{0xFFFFFF0000};
 #else
   raw_addr &= 0x3FFFF000;
 
@@ -267,28 +316,29 @@ void* OS::GetRandomMmapAddr() {
   raw_addr += 0x20000000;
 #endif
 #endif
-  return reinterpret_cast<void*>(raw_addr);
 #endif
+  return reinterpret_cast<void*>(raw_addr);
 }
 
-// TODO(bbudge) Move Cygwin and Fuschia stuff into platform-specific files.
+// TODO(bbudge) Move Cygwin and Fuchsia stuff into platform-specific files.
 #if !V8_OS_CYGWIN && !V8_OS_FUCHSIA
 // static
-void* OS::Allocate(void* address, size_t size, size_t alignment,
+void* OS::Allocate(void* hint, size_t size, size_t alignment,
                    MemoryPermission access) {
   size_t page_size = AllocatePageSize();
   DCHECK_EQ(0, size % page_size);
   DCHECK_EQ(0, alignment % page_size);
-  address = AlignedAddress(address, alignment);
+  hint = AlignedAddress(hint, alignment);
   // Add the maximum misalignment so we are guaranteed an aligned base address.
   size_t request_size = size + (alignment - page_size);
   request_size = RoundUp(request_size, OS::AllocatePageSize());
-  void* result = base::Allocate(address, request_size, access);
+  void* result = base::Allocate(hint, request_size, access);
   if (result == nullptr) return nullptr;
 
   // Unmap memory allocated before the aligned base address.
   uint8_t* base = static_cast<uint8_t*>(result);
-  uint8_t* aligned_base = RoundUp(base, alignment);
+  uint8_t* aligned_base = reinterpret_cast<uint8_t*>(
+      RoundUp(reinterpret_cast<uintptr_t>(base), alignment));
   if (aligned_base != base) {
     DCHECK_LT(base, aligned_base);
     size_t prefix_size = static_cast<size_t>(aligned_base - base);
@@ -329,7 +379,48 @@ bool OS::SetPermissions(void* address, size_t size, MemoryPermission access) {
   int prot = GetProtectionFromMemoryPermission(access);
   int ret = mprotect(address, size, prot);
   if (ret == 0 && access == OS::MemoryPermission::kNoAccess) {
-    ret = ReclaimInaccessibleMemory(address, size);
+    // This is advisory; ignore errors and continue execution.
+    USE(DiscardSystemPages(address, size));
+  }
+
+// For accounting purposes, we want to call MADV_FREE_REUSE on macOS after
+// changing permissions away from OS::MemoryPermission::kNoAccess. Since this
+// state is not kept at this layer, we always call this if access != kNoAccess.
+// The cost is a syscall that effectively no-ops.
+// TODO(erikchen): Fix this to only call MADV_FREE_REUSE when necessary.
+// https://crbug.com/823915
+#if defined(OS_MACOSX)
+  if (access != OS::MemoryPermission::kNoAccess)
+    madvise(address, size, MADV_FREE_REUSE);
+#endif
+
+  return ret == 0;
+}
+
+bool OS::DiscardSystemPages(void* address, size_t size) {
+  DCHECK_EQ(0, reinterpret_cast<uintptr_t>(address) % CommitPageSize());
+  DCHECK_EQ(0, size % CommitPageSize());
+#if defined(OS_MACOSX)
+  // On OSX, MADV_FREE_REUSABLE has comparable behavior to MADV_FREE, but also
+  // marks the pages with the reusable bit, which allows both Activity Monitor
+  // and memory-infra to correctly track the pages.
+  int ret = madvise(address, size, MADV_FREE_REUSABLE);
+#elif defined(_AIX) || defined(V8_OS_SOLARIS)
+  int ret = madvise(reinterpret_cast<caddr_t>(address), size, MADV_FREE);
+#else
+  int ret = madvise(address, size, MADV_FREE);
+#endif
+  if (ret != 0 && errno == ENOSYS)
+    return true;  // madvise is not available on all systems.
+  if (ret != 0 && errno == EINVAL) {
+// MADV_FREE only works on Linux 4.5+ . If request failed, retry with older
+// MADV_DONTNEED . Note that MADV_FREE being defined at compile time doesn't
+// imply runtime support.
+#if defined(_AIX) || defined(V8_OS_SOLARIS)
+    ret = madvise(reinterpret_cast<caddr_t>(address), size, MADV_DONTNEED);
+#else
+    ret = madvise(address, size, MADV_DONTNEED);
+#endif
   }
   return ret == 0;
 }
@@ -404,14 +495,22 @@ class PosixMemoryMappedFile final : public OS::MemoryMappedFile {
 
 
 // static
-OS::MemoryMappedFile* OS::MemoryMappedFile::open(const char* name) {
-  if (FILE* file = fopen(name, "r+")) {
+OS::MemoryMappedFile* OS::MemoryMappedFile::open(const char* name,
+                                                 FileMode mode) {
+  const char* fopen_mode = (mode == FileMode::kReadOnly) ? "r" : "r+";
+  if (FILE* file = fopen(name, fopen_mode)) {
     if (fseek(file, 0, SEEK_END) == 0) {
       long size = ftell(file);  // NOLINT(runtime/int)
-      if (size >= 0) {
+      if (size == 0) return new PosixMemoryMappedFile(file, nullptr, 0);
+      if (size > 0) {
+        int prot = PROT_READ;
+        int flags = MAP_PRIVATE;
+        if (mode == FileMode::kReadWrite) {
+          prot |= PROT_WRITE;
+          flags = MAP_SHARED;
+        }
         void* const memory =
-            mmap(OS::GetRandomMmapAddr(), size, PROT_READ | PROT_WRITE,
-                 MAP_SHARED, fileno(file), 0);
+            mmap(OS::GetRandomMmapAddr(), size, prot, flags, fileno(file), 0);
         if (memory != MAP_FAILED) {
           return new PosixMemoryMappedFile(file, memory, size);
         }
@@ -422,11 +521,11 @@ OS::MemoryMappedFile* OS::MemoryMappedFile::open(const char* name) {
   return nullptr;
 }
 
-
 // static
 OS::MemoryMappedFile* OS::MemoryMappedFile::create(const char* name,
                                                    size_t size, void* initial) {
   if (FILE* file = fopen(name, "w+")) {
+    if (size == 0) return new PosixMemoryMappedFile(file, 0, 0);
     size_t result = fwrite(initial, 1, size, file);
     if (result == size && !ferror(file)) {
       void* memory = mmap(OS::GetRandomMmapAddr(), result,
@@ -442,7 +541,7 @@ OS::MemoryMappedFile* OS::MemoryMappedFile::create(const char* name,
 
 
 PosixMemoryMappedFile::~PosixMemoryMappedFile() {
-  if (memory_) CHECK(OS::Free(memory_, size_));
+  if (memory_) CHECK(OS::Free(memory_, RoundUp(size_, OS::AllocatePageSize())));
   fclose(file_);
 }
 
@@ -462,7 +561,7 @@ int OS::GetCurrentThreadId() {
 #elif V8_OS_AIX
   return static_cast<int>(thread_self());
 #elif V8_OS_FUCHSIA
-  return static_cast<int>(pthread_self());
+  return static_cast<int>(zx_thread_self());
 #elif V8_OS_SOLARIS
   return static_cast<int>(pthread_self());
 #else
@@ -470,11 +569,19 @@ int OS::GetCurrentThreadId() {
 #endif
 }
 
+void OS::ExitProcess(int exit_code) {
+  // Use _exit instead of exit to avoid races between isolate
+  // threads and static destructors.
+  fflush(stdout);
+  fflush(stderr);
+  _exit(exit_code);
+}
 
 // ----------------------------------------------------------------------------
 // POSIX date/time support.
 //
 
+#if !defined(V8_OS_FUCHSIA)
 int OS::GetUserTime(uint32_t* secs, uint32_t* usecs) {
   struct rusage usage;
 
@@ -483,7 +590,7 @@ int OS::GetUserTime(uint32_t* secs, uint32_t* usecs) {
   *usecs = static_cast<uint32_t>(usage.ru_utime.tv_usec);
   return 0;
 }
-
+#endif
 
 double OS::TimeCurrentMillis() {
   return Time::Now().ToJsTime();
@@ -622,11 +729,6 @@ int OS::VSNPrintF(char* str,
 // POSIX string support.
 //
 
-char* OS::StrChr(char* str, int c) {
-  return strchr(str, c);
-}
-
-
 void OS::StrNCpy(char* dest, int length, const char* src, size_t n) {
   strncpy(dest, src, n);
 }
@@ -691,7 +793,7 @@ static void* ThreadEntry(void* arg) {
   // We take the lock here to make sure that pthread_create finished first since
   // we don't know which thread will run first (the original thread or the new
   // one).
-  { LockGuard<Mutex> lock_guard(&thread->data()->thread_creation_mutex_); }
+  { MutexGuard lock_guard(&thread->data()->thread_creation_mutex_); }
   SetThreadName(thread->name());
   DCHECK_NE(thread->data()->thread_, kNoThread);
   thread->NotifyStartedAndRun();
@@ -704,13 +806,12 @@ void Thread::set_name(const char* name) {
   name_[sizeof(name_) - 1] = '\0';
 }
 
-
-void Thread::Start() {
+bool Thread::Start() {
   int result;
   pthread_attr_t attr;
   memset(&attr, 0, sizeof(attr));
   result = pthread_attr_init(&attr);
-  DCHECK_EQ(0, result);
+  if (result != 0) return false;
   size_t stack_size = stack_size_;
   if (stack_size == 0) {
 #if V8_OS_MACOSX
@@ -723,17 +824,17 @@ void Thread::Start() {
   }
   if (stack_size > 0) {
     result = pthread_attr_setstacksize(&attr, stack_size);
-    DCHECK_EQ(0, result);
+    if (result != 0) return pthread_attr_destroy(&attr), false;
   }
   {
-    LockGuard<Mutex> lock_guard(&data_->thread_creation_mutex_);
+    MutexGuard lock_guard(&data_->thread_creation_mutex_);
     result = pthread_create(&data_->thread_, &attr, ThreadEntry, this);
+    if (result != 0 || data_->thread_ == kNoThread) {
+      return pthread_attr_destroy(&attr), false;
+    }
   }
-  DCHECK_EQ(0, result);
   result = pthread_attr_destroy(&attr);
-  DCHECK_EQ(0, result);
-  DCHECK_NE(data_->thread_, kNoThread);
-  USE(result);
+  return result == 0;
 }
 
 void Thread::Join() { pthread_join(data_->thread_, nullptr); }
@@ -765,7 +866,7 @@ static pthread_key_t LocalKeyToPthreadKey(Thread::LocalStorageKey local_key) {
 
 #ifdef V8_FAST_TLS_SUPPORTED
 
-static Atomic32 tls_base_offset_initialized = 0;
+static std::atomic<bool> tls_base_offset_initialized{false};
 intptr_t kMacTlsBaseOffset = 0;
 
 // It's safe to do the initialization more that once, but it has to be
@@ -776,7 +877,7 @@ static void InitializeTlsBaseOffset() {
   size_t buffer_size = kBufferSize;
   int ctl_name[] = { CTL_KERN , KERN_OSRELEASE };
   if (sysctl(ctl_name, 2, buffer, &buffer_size, nullptr, 0) != 0) {
-    V8_Fatal(__FILE__, __LINE__, "V8 failed to get kernel version");
+    FATAL("V8 failed to get kernel version");
   }
   // The buffer now contains a string of the form XX.YY.ZZ, where
   // XX is the major kernel version component.
@@ -801,7 +902,7 @@ static void InitializeTlsBaseOffset() {
     kMacTlsBaseOffset = 0;
   }
 
-  Release_Store(&tls_base_offset_initialized, 1);
+  tls_base_offset_initialized.store(true, std::memory_order_release);
 }
 
 
@@ -810,8 +911,7 @@ static void CheckFastTls(Thread::LocalStorageKey key) {
   Thread::SetThreadLocal(key, expected);
   void* actual = Thread::GetExistingThreadLocal(key);
   if (expected != actual) {
-    V8_Fatal(__FILE__, __LINE__,
-             "V8 failed to initialize fast TLS on current kernel");
+    FATAL("V8 failed to initialize fast TLS on current kernel");
   }
   Thread::SetThreadLocal(key, nullptr);
 }
@@ -822,7 +922,7 @@ static void CheckFastTls(Thread::LocalStorageKey key) {
 Thread::LocalStorageKey Thread::CreateThreadLocalKey() {
 #ifdef V8_FAST_TLS_SUPPORTED
   bool check_fast_tls = false;
-  if (tls_base_offset_initialized == 0) {
+  if (!tls_base_offset_initialized.load(std::memory_order_acquire)) {
     check_fast_tls = true;
     InitializeTlsBaseOffset();
   }

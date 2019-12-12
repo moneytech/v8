@@ -25,101 +25,32 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import itertools
 import os
 import re
 
 from testrunner.local import testsuite
 from testrunner.objects import testcase
+from testrunner.outproc import webkit
 
 FILES_PATTERN = re.compile(r"//\s+Files:(.*)")
 SELF_SCRIPT_PATTERN = re.compile(r"//\s+Env: TEST_FILE_NAME")
 
 
-# TODO (machenbach): Share commonalities with mjstest.
-class TestSuite(testsuite.TestSuite):
-  def ListTests(self, context):
-    tests = []
-    for dirname, dirs, files in os.walk(self.root):
-      for dotted in [x for x in dirs if x.startswith('.')]:
-        dirs.remove(dotted)
-      if 'resources' in dirs:
-        dirs.remove('resources')
+class TestLoader(testsuite.JSTestLoader):
+  @property
+  def excluded_dirs(self):
+    return {"resources"}
 
-      dirs.sort()
-      files.sort()
-      for filename in files:
-        if filename.endswith(".js"):
-          fullpath = os.path.join(dirname, filename)
-          relpath = fullpath[len(self.root) + 1 : -3]
-          testname = relpath.replace(os.path.sep, "/")
-          test = self._create_test(testname)
-          tests.append(test)
-    return tests
+
+class TestSuite(testsuite.TestSuite):
+  def _test_loader_class(self):
+    return TestLoader
 
   def _test_class(self):
     return TestCase
 
-  # TODO(machenbach): Share with test/message/testcfg.py
-  def _IgnoreLine(self, string):
-    """Ignore empty lines, valgrind output, Android output and trace
-    incremental marking output."""
-    if not string:
-      return True
-    return (string.startswith("==") or string.startswith("**") or
-            string.startswith("ANDROID") or "[IncrementalMarking]" in string or
-            # FIXME(machenbach): The test driver shouldn't try to use slow
-            # asserts if they weren't compiled. This fails in optdebug=2.
-            string == "Warning: unknown flag --enable-slow-asserts." or
-            string == "Try --help for options")
 
-  def IsFailureOutput(self, test, output):
-    if super(TestSuite, self).IsFailureOutput(test, output):
-      return True
-    file_name = os.path.join(self.root, test.path) + "-expected.txt"
-    with file(file_name, "r") as expected:
-      expected_lines = expected.readlines()
-
-    def ExpIterator():
-      for line in expected_lines:
-        if line.startswith("#") or not line.strip():
-          continue
-        yield line.strip()
-
-    def ActIterator(lines):
-      for line in lines:
-        if self._IgnoreLine(line.strip()):
-          continue
-        yield line.strip()
-
-    def ActBlockIterator():
-      """Iterates over blocks of actual output lines."""
-      lines = output.stdout.splitlines()
-      start_index = 0
-      found_eqeq = False
-      for index, line in enumerate(lines):
-        # If a stress test separator is found:
-        if line.startswith("=="):
-          # Iterate over all lines before a separator except the first.
-          if not found_eqeq:
-            found_eqeq = True
-          else:
-            yield ActIterator(lines[start_index:index])
-          # The next block of output lines starts after the separator.
-          start_index = index + 1
-      # Iterate over complete output if no separator was found.
-      if not found_eqeq:
-        yield ActIterator(lines)
-
-    for act_iterator in ActBlockIterator():
-      for (expected, actual) in itertools.izip_longest(
-          ExpIterator(), act_iterator, fillvalue=''):
-        if expected != actual:
-          return True
-      return False
-
-
-class TestCase(testcase.TestCase):
+class TestCase(testcase.D8TestCase):
   def __init__(self, *args, **kwargs):
     super(TestCase, self).__init__(*args, **kwargs)
 
@@ -148,9 +79,9 @@ class TestCase(testcase.TestCase):
     files.append(os.path.join(self.suite.root, "resources/standalone-post.js"))
     return files
 
-  def _get_files_params(self, ctx):
+  def _get_files_params(self):
     files = self._source_files
-    if ctx.isolates:
+    if self._test_config.isolates:
       files = files + ['--isolate'] + files
     return files
 
@@ -160,6 +91,12 @@ class TestCase(testcase.TestCase):
   def _get_source_path(self):
     return os.path.join(self.suite.root, self.path + self._get_suffix())
 
+  @property
+  def output_proc(self):
+    return webkit.OutProc(
+        self.expected_outcomes,
+        os.path.join(self.suite.root, self.path) + '-expected.txt')
 
-def GetSuite(name, root):
-  return TestSuite(name, root)
+
+def GetSuite(*args, **kwargs):
+  return TestSuite(*args, **kwargs)

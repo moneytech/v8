@@ -7,8 +7,9 @@
 
 #include "src/base/compiler-specific.h"
 #include "src/compiler/simplified-operator.h"
-#include "src/elements-kind.h"
-#include "src/globals.h"
+#include "src/compiler/write-barrier-kind.h"
+#include "src/objects/elements-kind.h"
+#include "src/objects/js-objects.h"
 
 namespace v8 {
 namespace internal {
@@ -23,11 +24,8 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   // ===========================================================================
   // Access to external values (based on external references).
 
-  // Provides access to a tagged field identified by an external reference.
-  static FieldAccess ForExternalTaggedValue();
-
-  // Provides access to an uint8 field identified by an external reference.
-  static FieldAccess ForExternalUint8Value();
+  // Provides access to an IntPtr field identified by an external reference.
+  static FieldAccess ForExternalIntPtr();
 
   // ===========================================================================
   // Access to heap object fields and elements (based on tagged pointer).
@@ -41,14 +39,26 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   // Provides access to BigInt's bit field.
   static FieldAccess ForBigIntBitfield();
 
+  // Provides access to BigInt's 32 bit padding that is placed after the
+  // bitfield on 64 bit architectures without pointer compression. Do not use
+  // this on 32 bit architectures.
+  static FieldAccess ForBigIntOptionalPadding();
+
+  // Provides access to BigInt's least significant digit on 64 bit
+  // architectures. Do not use this on 32 bit architectures.
+  static FieldAccess ForBigIntLeastSignificantDigit64();
+
   // Provides access to JSObject::properties() field.
   static FieldAccess ForJSObjectPropertiesOrHash();
+
+  // Provides access to JSObject::properties() field for known pointers.
+  static FieldAccess ForJSObjectPropertiesOrHashKnownPointer();
 
   // Provides access to JSObject::elements() field.
   static FieldAccess ForJSObjectElements();
 
   // Provides access to JSObject inobject property fields.
-  static FieldAccess ForJSObjectInObjectProperty(Handle<Map> map, int index);
+  static FieldAccess ForJSObjectInObjectProperty(const MapRef& map, int index);
   static FieldAccess ForJSObjectOffset(
       int offset, WriteBarrierKind write_barrier_kind = kFullWriteBarrier);
 
@@ -70,8 +80,8 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   // Provides access to JSFunction::shared() field.
   static FieldAccess ForJSFunctionSharedFunctionInfo();
 
-  // Provides access to JSFunction::feedback_vector() field.
-  static FieldAccess ForJSFunctionFeedbackVector();
+  // Provides access to JSFunction::feedback_cell() field.
+  static FieldAccess ForJSFunctionFeedbackCell();
 
   // Provides access to JSFunction::code() field.
   static FieldAccess ForJSFunctionCode();
@@ -94,8 +104,8 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   // Provides access to JSGeneratorObject::input_or_debug_pos() field.
   static FieldAccess ForJSGeneratorObjectInputOrDebugPos();
 
-  // Provides access to JSGeneratorObject::register_file() field.
-  static FieldAccess ForJSGeneratorObjectRegisterFile();
+  // Provides access to JSGeneratorObject::parameters_and_registers() field.
+  static FieldAccess ForJSGeneratorObjectParametersAndRegisters();
 
   // Provides access to JSGeneratorObject::function() field.
   static FieldAccess ForJSGeneratorObjectFunction();
@@ -106,17 +116,17 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   // Provides access to JSGeneratorObject::resume_mode() field.
   static FieldAccess ForJSGeneratorObjectResumeMode();
 
+  // Provides access to JSAsyncFunctionObject::promise() field.
+  static FieldAccess ForJSAsyncFunctionObjectPromise();
+
   // Provides access to JSAsyncGeneratorObject::queue() field.
   static FieldAccess ForJSAsyncGeneratorObjectQueue();
 
-  // Provides access to JSAsyncGeneratorObject::awaited_promise() field.
-  static FieldAccess ForJSAsyncGeneratorObjectAwaitedPromise();
+  // Provides access to JSAsyncGeneratorObject::is_awaiting() field.
+  static FieldAccess ForJSAsyncGeneratorObjectIsAwaiting();
 
   // Provides access to JSArray::length() field.
   static FieldAccess ForJSArrayLength(ElementsKind elements_kind);
-
-  // Provides access to JSArrayBuffer::backing_store() field.
-  static FieldAccess ForJSArrayBufferBackingStore();
 
   // Provides access to JSArrayBuffer::bit_field() field.
   static FieldAccess ForJSArrayBufferBitField();
@@ -132,6 +142,15 @@ class V8_EXPORT_PRIVATE AccessBuilder final
 
   // Provides access to JSTypedArray::length() field.
   static FieldAccess ForJSTypedArrayLength();
+
+  // Provides access to JSTypedArray::base_pointer() field.
+  static FieldAccess ForJSTypedArrayBasePointer();
+
+  // Provides access to JSTypedArray::external_pointer() field.
+  static FieldAccess ForJSTypedArrayExternalPointer();
+
+  // Provides access to JSDataView::data_pointer() field.
+  static FieldAccess ForJSDataViewDataPointer();
 
   // Provides access to JSDate::value() field.
   static FieldAccess ForJSDateValue();
@@ -162,12 +181,6 @@ class V8_EXPORT_PRIVATE AccessBuilder final
 
   // Provides access to PropertyArray::length() field.
   static FieldAccess ForPropertyArrayLengthAndHash();
-
-  // Provides access to FixedTypedArrayBase::base_pointer() field.
-  static FieldAccess ForFixedTypedArrayBaseBasePointer();
-
-  // Provides access to FixedTypedArrayBase::external_pointer() field.
-  static FieldAccess ForFixedTypedArrayBaseExternalPointer();
 
   // Provides access to DescriptorArray::enum_cache() field.
   static FieldAccess ForDescriptorArrayEnumCache();
@@ -220,45 +233,29 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   // Provides access to ExternalString::resource_data() field.
   static FieldAccess ForExternalStringResourceData();
 
-  // Provides access to ExternalOneByteString characters.
-  static ElementAccess ForExternalOneByteStringCharacter();
-
-  // Provides access to ExternalTwoByteString characters.
-  static ElementAccess ForExternalTwoByteStringCharacter();
-
   // Provides access to SeqOneByteString characters.
   static ElementAccess ForSeqOneByteStringCharacter();
 
   // Provides access to SeqTwoByteString characters.
   static ElementAccess ForSeqTwoByteStringCharacter();
 
-  // Provides access to JSGlobalObject::global_proxy() field.
-  static FieldAccess ForJSGlobalObjectGlobalProxy();
-
-  // Provides access to JSGlobalObject::native_context() field.
-  static FieldAccess ForJSGlobalObjectNativeContext();
-
   // Provides access to JSGlobalProxy::native_context() field.
   static FieldAccess ForJSGlobalProxyNativeContext();
 
-  // Provides access to JSArrayIterator::object() field.
-  static FieldAccess ForJSArrayIteratorObject();
+  // Provides access to JSArrayIterator::iterated_object() field.
+  static FieldAccess ForJSArrayIteratorIteratedObject();
 
-  // Provides access to JSArrayIterator::index() field.
-  static FieldAccess ForJSArrayIteratorIndex(InstanceType type = JS_OBJECT_TYPE,
-                                             ElementsKind kind = NO_ELEMENTS);
+  // Provides access to JSArrayIterator::next_index() field.
+  static FieldAccess ForJSArrayIteratorNextIndex();
 
-  // Provides access to JSArrayIterator::object_map() field.
-  static FieldAccess ForJSArrayIteratorObjectMap();
+  // Provides access to JSArrayIterator::kind() field.
+  static FieldAccess ForJSArrayIteratorKind();
 
   // Provides access to JSStringIterator::string() field.
   static FieldAccess ForJSStringIteratorString();
 
   // Provides access to JSStringIterator::index() field.
   static FieldAccess ForJSStringIteratorIndex();
-
-  // Provides access to JSValue::value() field.
-  static FieldAccess ForValue();
 
   // Provides access to Cell::value() field.
   static FieldAccess ForCellValue();
@@ -271,16 +268,23 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   static FieldAccess ForFixedArraySlot(
       size_t index, WriteBarrierKind write_barrier_kind = kFullWriteBarrier);
 
+  // Provides access to ScopeInfo flags.
+  static FieldAccess ForScopeInfoFlags();
+
   // Provides access to Context slots.
   static FieldAccess ForContextSlot(size_t index);
 
-  // Provides access to ContextExtension fields.
-  static FieldAccess ForContextExtensionScopeInfo();
-  static FieldAccess ForContextExtensionExtension();
+  // Provides access to Context slots that are known to be pointers.
+  static FieldAccess ForContextSlotKnownPointer(size_t index);
 
   // Provides access to FixedArray elements.
   static ElementAccess ForFixedArrayElement();
-  static ElementAccess ForFixedArrayElement(ElementsKind kind);
+  static ElementAccess ForFixedArrayElement(
+      ElementsKind kind,
+      LoadSensitivity load_sensitivity = LoadSensitivity::kUnsafe);
+
+  // Provides access to stack arguments
+  static ElementAccess ForStackArgument();
 
   // Provides access to FixedDoubleArray elements.
   static ElementAccess ForFixedDoubleArrayElement();
@@ -292,25 +296,25 @@ class V8_EXPORT_PRIVATE AccessBuilder final
   static FieldAccess ForEnumCacheIndices();
 
   // Provides access to Fixed{type}TypedArray and External{type}Array elements.
-  static ElementAccess ForTypedArrayElement(ExternalArrayType type,
-                                            bool is_external);
+  static ElementAccess ForTypedArrayElement(
+      ExternalArrayType type, bool is_external,
+      LoadSensitivity load_sensitivity = LoadSensitivity::kUnsafe);
 
   // Provides access to HashTable fields.
   static FieldAccess ForHashTableBaseNumberOfElements();
   static FieldAccess ForHashTableBaseNumberOfDeletedElement();
   static FieldAccess ForHashTableBaseCapacity();
 
-  // Provides access to OrderedHashTableBase fields.
-  static FieldAccess ForOrderedHashTableBaseNextTable();
-  static FieldAccess ForOrderedHashTableBaseNumberOfBuckets();
-  static FieldAccess ForOrderedHashTableBaseNumberOfElements();
-  static FieldAccess ForOrderedHashTableBaseNumberOfDeletedElements();
+  // Provides access to OrderedHashMapOrSet fields.
+  static FieldAccess ForOrderedHashMapOrSetNextTable();
+  static FieldAccess ForOrderedHashMapOrSetNumberOfBuckets();
+  static FieldAccess ForOrderedHashMapOrSetNumberOfElements();
+  static FieldAccess ForOrderedHashMapOrSetNumberOfDeletedElements();
 
   // Provides access to OrderedHashMap elements.
   static ElementAccess ForOrderedHashMapEntryValue();
 
   // Provides access to Dictionary fields.
-  static FieldAccess ForDictionaryMaxNumberKey();
   static FieldAccess ForDictionaryNextEnumerationIndex();
   static FieldAccess ForDictionaryObjectHashIndex();
 

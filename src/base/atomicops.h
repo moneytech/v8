@@ -39,21 +39,22 @@
 namespace v8 {
 namespace base {
 
-typedef char Atomic8;
-typedef int32_t Atomic32;
+using Atomic8 = char;
+using Atomic16 = int16_t;
+using Atomic32 = int32_t;
 #if defined(V8_HOST_ARCH_64_BIT)
 // We need to be able to go between Atomic64 and AtomicWord implicitly.  This
 // means Atomic64 and AtomicWord should be the same type on 64-bit.
 #if defined(__ILP32__)
-typedef int64_t Atomic64;
+using Atomic64 = int64_t;
 #else
-typedef intptr_t Atomic64;
+using Atomic64 = intptr_t;
 #endif  // defined(__ILP32__)
 #endif  // defined(V8_HOST_ARCH_64_BIT)
 
 // Use AtomicWord for a machine-sized pointer.  It will use the Atomic32 or
 // Atomic64 routines below, depending on your architecture.
-typedef intptr_t AtomicWord;
+using AtomicWord = intptr_t;
 
 // Atomically execute:
 //      result = *ptr;
@@ -65,6 +66,8 @@ typedef intptr_t AtomicWord;
 // Always return the old value of "*ptr"
 //
 // This routine implies no memory barriers.
+Atomic16 Relaxed_CompareAndSwap(volatile Atomic16* ptr, Atomic16 old_value,
+                                Atomic16 new_value);
 Atomic32 Relaxed_CompareAndSwap(volatile Atomic32* ptr, Atomic32 old_value,
                                 Atomic32 new_value);
 
@@ -94,13 +97,17 @@ Atomic32 Acquire_CompareAndSwap(volatile Atomic32* ptr,
 Atomic32 Release_CompareAndSwap(volatile Atomic32* ptr,
                                 Atomic32 old_value,
                                 Atomic32 new_value);
+Atomic32 AcquireRelease_CompareAndSwap(volatile Atomic32* ptr,
+                                       Atomic32 old_value, Atomic32 new_value);
 
 void SeqCst_MemoryFence();
 void Relaxed_Store(volatile Atomic8* ptr, Atomic8 value);
+void Relaxed_Store(volatile Atomic16* ptr, Atomic16 value);
 void Relaxed_Store(volatile Atomic32* ptr, Atomic32 value);
 void Release_Store(volatile Atomic32* ptr, Atomic32 value);
 
 Atomic8 Relaxed_Load(volatile const Atomic8* ptr);
+Atomic16 Relaxed_Load(volatile const Atomic16* ptr);
 Atomic32 Relaxed_Load(volatile const Atomic32* ptr);
 Atomic32 Acquire_Load(volatile const Atomic32* ptr);
 
@@ -115,9 +122,10 @@ Atomic64 Barrier_AtomicIncrement(volatile Atomic64* ptr, Atomic64 increment);
 Atomic64 Acquire_CompareAndSwap(volatile Atomic64* ptr,
                                 Atomic64 old_value,
                                 Atomic64 new_value);
-Atomic64 Release_CompareAndSwap(volatile Atomic64* ptr,
-                                Atomic64 old_value,
+Atomic64 Release_CompareAndSwap(volatile Atomic64* ptr, Atomic64 old_value,
                                 Atomic64 new_value);
+Atomic64 AcquireRelease_CompareAndSwap(volatile Atomic64* ptr,
+                                       Atomic64 old_value, Atomic64 new_value);
 void Relaxed_Store(volatile Atomic64* ptr, Atomic64 value);
 void Release_Store(volatile Atomic64* ptr, Atomic64 value);
 Atomic64 Relaxed_Load(volatile const Atomic64* ptr);

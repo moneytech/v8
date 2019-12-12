@@ -32,7 +32,7 @@ TEST(TemplateUtilsTest, MakeArraySimple) {
 
 namespace {
 constexpr int doubleIntValue(int i) { return i * 2; }
-};  // namespace
+}  // namespace
 
 TEST(TemplateUtilsTest, MakeArrayConstexpr) {
   constexpr auto computed_array = base::make_array<3>(doubleIntValue);
@@ -93,13 +93,19 @@ static_assert(has_output_operator<uint64_t>::value, "int can be output");
 // Classes:
 class TestClass1 {};
 class TestClass2 {};
-extern std::ostream& operator<<(std::ostream& str, TestClass2&);
+extern std::ostream& operator<<(std::ostream& str, const TestClass2&);
+class TestClass3 {};
+extern std::ostream& operator<<(std::ostream& str, TestClass3);
 static_assert(!has_output_operator<TestClass1>::value,
               "TestClass1 can not be output");
 static_assert(has_output_operator<TestClass2>::value,
               "non-const TestClass2 can be output");
-static_assert(!has_output_operator<const TestClass2>::value,
-              "const TestClass2 can not be output");
+static_assert(has_output_operator<const TestClass2>::value,
+              "const TestClass2 can be output");
+static_assert(has_output_operator<TestClass3>::value,
+              "non-const TestClass3 can be output");
+static_assert(has_output_operator<const TestClass3>::value,
+              "const TestClass3 can be output");
 
 //////////////////////////////
 // Test fold.
@@ -130,7 +136,7 @@ TEST(TemplateUtilsTest, FoldMoveOnlyType) {
     str->push_back(c);
     return str;
   };
-  std::unique_ptr<std::string> str = base::make_unique<std::string>("foo");
+  std::unique_ptr<std::string> str = std::make_unique<std::string>("foo");
   std::unique_ptr<std::string> folded =
       base::fold(fn, std::move(str), 'b', 'a', 'r');
   CHECK_NULL(str);

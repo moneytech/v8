@@ -27,11 +27,11 @@
 
 #include <stdlib.h>
 
-#include "src/v8.h"
+#include "src/init/v8.h"
 
-#include "src/api.h"
-#include "src/frames-inl.h"
-#include "src/string-stream.h"
+#include "src/api/api-inl.h"
+#include "src/execution/frames-inl.h"
+#include "src/strings/string-stream.h"
 #include "test/cctest/cctest.h"
 
 using ::v8::ObjectTemplate;
@@ -84,36 +84,65 @@ THREADED_TEST(PropertyHandler) {
   Local<Script> setter;
   // check function instance accessors
   getter = v8_compile("var obj = new Fun(); obj.instance_foo;");
-  CHECK_EQ(900, getter->Run(env.local())
-                    .ToLocalChecked()
-                    ->Int32Value(env.local())
-                    .FromJust());
+  for (int i = 0; i < 4; i++) {
+    CHECK_EQ(900, getter->Run(env.local())
+                      .ToLocalChecked()
+                      ->Int32Value(env.local())
+                      .FromJust());
+  }
   setter = v8_compile("obj.instance_foo = 901;");
-  CHECK_EQ(901, setter->Run(env.local())
-                    .ToLocalChecked()
-                    ->Int32Value(env.local())
-                    .FromJust());
+  for (int i = 0; i < 4; i++) {
+    CHECK_EQ(901, setter->Run(env.local())
+                      .ToLocalChecked()
+                      ->Int32Value(env.local())
+                      .FromJust());
+  }
   getter = v8_compile("obj.bar;");
-  CHECK_EQ(907, getter->Run(env.local())
-                    .ToLocalChecked()
-                    ->Int32Value(env.local())
-                    .FromJust());
+  for (int i = 0; i < 4; i++) {
+    CHECK_EQ(907, getter->Run(env.local())
+                      .ToLocalChecked()
+                      ->Int32Value(env.local())
+                      .FromJust());
+  }
   setter = v8_compile("obj.bar = 908;");
-  CHECK_EQ(908, setter->Run(env.local())
-                    .ToLocalChecked()
-                    ->Int32Value(env.local())
-                    .FromJust());
+  for (int i = 0; i < 4; i++) {
+    CHECK_EQ(908, setter->Run(env.local())
+                      .ToLocalChecked()
+                      ->Int32Value(env.local())
+                      .FromJust());
+  }
   // check function static accessors
   getter = v8_compile("Fun.object_foo;");
-  CHECK_EQ(902, getter->Run(env.local())
-                    .ToLocalChecked()
-                    ->Int32Value(env.local())
-                    .FromJust());
+  for (int i = 0; i < 4; i++) {
+    CHECK_EQ(902, getter->Run(env.local())
+                      .ToLocalChecked()
+                      ->Int32Value(env.local())
+                      .FromJust());
+  }
   setter = v8_compile("Fun.object_foo = 903;");
-  CHECK_EQ(903, setter->Run(env.local())
-                    .ToLocalChecked()
-                    ->Int32Value(env.local())
-                    .FromJust());
+  for (int i = 0; i < 4; i++) {
+    CHECK_EQ(903, setter->Run(env.local())
+                      .ToLocalChecked()
+                      ->Int32Value(env.local())
+                      .FromJust());
+  }
+
+  // And now with null prototype.
+  CompileRun(env.local(), "obj.__proto__ = null;");
+  getter = v8_compile("obj.bar;");
+  for (int i = 0; i < 4; i++) {
+    CHECK_EQ(907, getter->Run(env.local())
+                      .ToLocalChecked()
+                      ->Int32Value(env.local())
+                      .FromJust());
+  }
+  setter = v8_compile("obj.bar = 908;");
+  for (int i = 0; i < 4; i++) {
+    CHECK_EQ(908, setter->Run(env.local())
+                      .ToLocalChecked()
+                      ->Int32Value(env.local())
+                      .FromJust());
+  }
 }
 
 
@@ -152,7 +181,7 @@ THREADED_TEST(GlobalVariableAccess) {
   templ->InstanceTemplate()->SetAccessor(
       v8_str("baz"), GetIntValue, SetIntValue,
       v8::External::New(isolate, &baz));
-  LocalContext env(0, templ->InstanceTemplate());
+  LocalContext env(nullptr, templ->InstanceTemplate());
   v8_compile("foo = (++bar) + baz")->Run(env.local()).ToLocalChecked();
   CHECK_EQ(-3, bar);
   CHECK_EQ(7, foo);
@@ -509,10 +538,9 @@ static void StackCheck(Local<String> name,
   for (int i = 0; !iter.done(); i++) {
     i::StackFrame* frame = iter.frame();
     CHECK(i != 0 || (frame->type() == i::StackFrame::EXIT));
-    i::Code* code = frame->LookupCode();
-    CHECK(code->IsCode());
-    i::Address pc = frame->pc();
-    CHECK(code->contains(pc));
+    i::Code code = frame->LookupCode();
+    CHECK(code.IsCode());
+    CHECK(code.contains(frame->pc()));
     iter.Advance();
   }
 }
@@ -773,7 +801,8 @@ TEST(PrototypeGetterAccessCheck) {
       "    x = obj.foo;"
       "  }"
       "  return x;"
-      "}");
+      "};"
+      "%PrepareFunctionForOptimization(f);");
 
   security_check_value = true;
   ExpectInt32("f()", 907);
@@ -784,7 +813,7 @@ TEST(PrototypeGetterAccessCheck) {
     CHECK(try_catch.HasCaught());
   }
 
-  // Test crankshaft.
+  // Test TurboFan.
   CompileRun("%OptimizeFunctionOnNextCall(f);");
 
   security_check_value = true;
@@ -820,4 +849,39 @@ TEST(Regress609134) {
       "Number.prototype.__proto__ = f;"
       "var a = 42;"
       "for (var i = 0; i<3; i++) { a.foo; }");
+}
+
+TEST(ObjectSetLazyDataProperty) {
+  LocalContext env;
+  v8::Isolate* isolate = env->GetIsolate();
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Object> obj = v8::Object::New(isolate);
+  CHECK(env->Global()->Set(env.local(), v8_str("obj"), obj).FromJust());
+
+  // Despite getting the property multiple times, the getter should only be
+  // called once and data property reads should continue to produce the same
+  // value.
+  static int getter_call_count;
+  getter_call_count = 0;
+  auto result = obj->SetLazyDataProperty(
+      env.local(), v8_str("foo"),
+      [](Local<Name> name, const v8::PropertyCallbackInfo<v8::Value>& info) {
+        getter_call_count++;
+        info.GetReturnValue().Set(getter_call_count);
+      });
+  CHECK(result.FromJust());
+  CHECK_EQ(0, getter_call_count);
+  for (int i = 0; i < 2; i++) {
+    ExpectInt32("obj.foo", 1);
+    CHECK_EQ(1, getter_call_count);
+  }
+
+  // Setting should overwrite the data property.
+  result = obj->SetLazyDataProperty(
+      env.local(), v8_str("bar"),
+      [](Local<Name> name, const v8::PropertyCallbackInfo<v8::Value>& info) {
+        CHECK(false);
+      });
+  CHECK(result.FromJust());
+  ExpectInt32("obj.bar = -1; obj.bar;", -1);
 }

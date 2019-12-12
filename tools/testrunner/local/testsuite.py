@@ -28,281 +28,290 @@
 
 import fnmatch
 import imp
+import itertools
 import os
+from contextlib import contextmanager
 
 from . import command
 from . import statusfile
 from . import utils
 from ..objects.testcase import TestCase
-from variants import ALL_VARIANTS, ALL_VARIANT_FLAGS, FAST_VARIANT_FLAGS
+from .variants import ALL_VARIANTS, ALL_VARIANT_FLAGS
 
 
-FAST_VARIANTS = set(["default", "turbofan"])
 STANDARD_VARIANT = set(["default"])
 
 
-class VariantGenerator(object):
-  def __init__(self, suite, variants):
+class VariantsGenerator(object):
+  def __init__(self, variants):
+    self._all_variants = [v for v in variants if v in ALL_VARIANTS]
+    self._standard_variant = [v for v in variants if v in STANDARD_VARIANT]
+
+  def gen(self, test):
+    """Generator producing (variant, flags, procid suffix) tuples."""
+    flags_set = self._get_flags_set(test)
+    for n, variant in enumerate(self._get_variants(test)):
+      yield (variant, flags_set[variant][0], n)
+
+  def _get_flags_set(self, test):
+    return ALL_VARIANT_FLAGS
+
+  def _get_variants(self, test):
+    if test.only_standard_variant:
+      return self._standard_variant
+    return self._all_variants
+
+
+class TestCombiner(object):
+  def get_group_key(self, test):
+    """To indicate what tests can be combined with each other we define a group
+    key for each test. Tests with the same group key can be combined. Test
+    without a group key (None) is not combinable with any other test.
+    """
+    raise NotImplementedError()
+
+  def combine(self, name, tests):
+    """Returns test combined from `tests`. Since we identify tests by their
+    suite and name, `name` parameter should be unique within one suite.
+    """
+    return self._combined_test_class()(name, tests)
+
+  def _combined_test_class(self):
+    raise NotImplementedError()
+
+
+class TestLoader(object):
+  """Base class for loading TestSuite tests after applying test suite
+  transformations."""
+
+  def __init__(self, suite, test_class, test_config, test_root):
     self.suite = suite
-    self.all_variants = ALL_VARIANTS & variants
-    self.fast_variants = FAST_VARIANTS & variants
-    self.standard_variant = STANDARD_VARIANT & variants
+    self.test_class = test_class
+    self.test_config = test_config
+    self.test_root = test_root
+    self.test_count_estimation = len(list(self._list_test_filenames()))
 
-  def FilterVariantsByTest(self, test):
-    result = self.all_variants
-    outcomes = test.suite.GetStatusFileOutcomes(test.name, test.variant)
-    if outcomes:
-      if statusfile.OnlyStandardVariant(outcomes):
-        return self.standard_variant
-      if statusfile.OnlyFastVariants(outcomes):
-        result = self.fast_variants
-    return result
+  def _list_test_filenames(self):
+    """Implemented by the subclassed TestLoaders to list filenames.
 
-  def GetFlagSets(self, test, variant):
-    outcomes = test.suite.GetStatusFileOutcomes(test.name, test.variant)
-    if outcomes and statusfile.OnlyFastVariants(outcomes):
-      return FAST_VARIANT_FLAGS[variant]
-    else:
-      return ALL_VARIANT_FLAGS[variant]
+    Filenames are expected to be sorted and are deterministic."""
+    raise NotImplementedError
 
+  def _should_filter_by_name(self, name):
+    return False
+
+  def _should_filter_by_test(self, test):
+    return False
+
+  def _filename_to_testname(self, filename):
+    """Hook for subclasses to write their own filename transformation
+    logic before the test creation."""
+    return filename
+
+  # TODO: not needed for every TestLoader, extract it into a subclass.
+  def _path_to_name(self, path):
+    if utils.IsWindows():
+      return path.replace(os.path.sep, "/")
+
+    return path
+
+  def _create_test(self, path, suite, **kwargs):
+    """Converts paths into test objects using the given options"""
+    return self.test_class(
+      suite, path, self._path_to_name(path), self.test_config, **kwargs)
+
+  def list_tests(self):
+    """Loads and returns the test objects for a TestSuite"""
+    # TODO: detect duplicate tests.
+    for filename in self._list_test_filenames():
+      if self._should_filter_by_name(filename):
+        continue
+
+      testname = self._filename_to_testname(filename)
+      case = self._create_test(testname, self.suite)
+      if self._should_filter_by_test(case):
+        continue
+
+      yield case
+
+
+class GenericTestLoader(TestLoader):
+  """Generic TestLoader implementing the logic for listing filenames"""
+  @property
+  def excluded_files(self):
+    return set()
+
+  @property
+  def excluded_dirs(self):
+    return set()
+
+  @property
+  def excluded_suffixes(self):
+    return set()
+
+  @property
+  def test_dirs(self):
+    return [self.test_root]
+
+  @property
+  def extensions(self):
+    return []
+
+  def __find_extension(self, filename):
+    for extension in self.extensions:
+      if filename.endswith(extension):
+        return extension
+
+    return False
+
+  def _should_filter_by_name(self, filename):
+    if not self.__find_extension(filename):
+      return True
+
+    for suffix in self.excluded_suffixes:
+      if filename.endswith(suffix):
+        return True
+
+    if os.path.basename(filename) in self.excluded_files:
+      return True
+
+    return False
+
+  def _filename_to_testname(self, filename):
+    extension = self.__find_extension(filename)
+    if not extension:
+      return filename
+
+    return filename[:-len(extension)]
+
+  def _to_relpath(self, abspath, test_root):
+    return os.path.relpath(abspath, test_root)
+
+  def _list_test_filenames(self):
+    for test_dir in sorted(self.test_dirs):
+      test_root = os.path.join(self.test_root, test_dir)
+      for dirname, dirs, files in os.walk(test_root, followlinks=True):
+        dirs.sort()
+        for dir in dirs:
+          if dir in self.excluded_dirs or dir.startswith('.'):
+            dirs.remove(dir)
+
+        files.sort()
+        for filename in files:
+          abspath = os.path.join(dirname, filename)
+
+          yield self._to_relpath(abspath, test_root)
+
+
+class JSTestLoader(GenericTestLoader):
+  @property
+  def extensions(self):
+    return [".js", ".mjs"]
+
+
+class TestGenerator(object):
+  def __init__(self, test_count_estimate, slow_tests, fast_tests):
+    self.test_count_estimate = test_count_estimate
+    self.slow_tests = slow_tests
+    self.fast_tests = fast_tests
+    self._rebuild_iterator()
+
+  def _rebuild_iterator(self):
+    self._iterator = itertools.chain(self.slow_tests, self.fast_tests)
+
+  def __iter__(self):
+    return self
+
+  def __next__(self):
+    return self.next()
+
+  def next(self):
+    return next(self._iterator)
+
+  def merge(self, test_generator):
+    self.test_count_estimate += test_generator.test_count_estimate
+    self.slow_tests = itertools.chain(
+      self.slow_tests, test_generator.slow_tests)
+    self.fast_tests = itertools.chain(
+      self.fast_tests, test_generator.fast_tests)
+    self._rebuild_iterator()
+
+
+@contextmanager
+def _load_testsuite_module(name, root):
+  f = None
+  try:
+    (f, pathname, description) = imp.find_module("testcfg", [root])
+    yield imp.load_module(name + "_testcfg", f, pathname, description)
+  finally:
+    if f:
+      f.close()
 
 class TestSuite(object):
   @staticmethod
-  def LoadTestSuite(root):
+  def Load(root, test_config, framework_name):
     name = root.split(os.path.sep)[-1]
-    f = None
-    try:
-      (f, pathname, description) = imp.find_module("testcfg", [root])
-      module = imp.load_module(name + "_testcfg", f, pathname, description)
-      return module.GetSuite(name, root)
-    finally:
-      if f:
-        f.close()
+    with _load_testsuite_module(name, root) as module:
+      return module.GetSuite(name, root, test_config, framework_name)
 
-  def __init__(self, name, root):
-    # Note: This might be called concurrently from different processes.
+  def __init__(self, name, root, test_config, framework_name):
     self.name = name  # string
     self.root = root  # string containing path
+    self.test_config = test_config
+    self.framework_name = framework_name  # name of the test runner impl
     self.tests = None  # list of TestCase objects
-    self.rules = None  # {variant: {test name: [rule]}}
-    self.prefix_rules = None  # {variant: {test name prefix: [rule]}}
+    self.statusfile = None
 
-    self._outcomes_cache = dict()
+    self._test_loader = self._test_loader_class()(
+      self, self._test_class(), self.test_config, self.root)
 
   def status_file(self):
     return "%s/%s.status" % (self.root, self.name)
 
-  def ListTests(self, context):
+  @property
+  def _test_loader_class(self):
     raise NotImplementedError
 
-  def _VariantGeneratorFactory(self):
-    """The variant generator class to be used."""
-    return VariantGenerator
+  def ListTests(self):
+    return self._test_loader.list_tests()
 
-  def CreateVariantGenerator(self, variants):
-    """Return a generator for the testing variants of this suite.
+  def __initialize_test_count_estimation(self):
+    # Retrieves a single test to initialize the test generator.
+    next(iter(self.ListTests()), None)
 
-    Args:
-      variants: List of variant names to be run as specified by the test
-                runner.
-    Returns: An object of type VariantGenerator.
+  def __calculate_test_count(self):
+    self.__initialize_test_count_estimation()
+    return self._test_loader.test_count_estimation
+
+  def load_tests_from_disk(self, statusfile_variables):
+    self.statusfile = statusfile.StatusFile(
+      self.status_file(), statusfile_variables)
+
+    test_count = self.__calculate_test_count()
+    slow_tests = (test for test in self.ListTests() if test.is_slow)
+    fast_tests = (test for test in self.ListTests() if not test.is_slow)
+    return TestGenerator(test_count, slow_tests, fast_tests)
+
+  def get_variants_gen(self, variants):
+    return self._variants_gen_class()(variants)
+
+  def _variants_gen_class(self):
+    return VariantsGenerator
+
+  def test_combiner_available(self):
+    return bool(self._test_combiner_class())
+
+  def get_test_combiner(self):
+    cls = self._test_combiner_class()
+    if cls:
+      return cls()
+    return None
+
+  def _test_combiner_class(self):
+    """Returns Combiner subclass. None if suite doesn't support combining
+    tests.
     """
-    return self._VariantGeneratorFactory()(self, set(variants))
-
-  def ReadStatusFile(self, variables):
-    with open(self.status_file()) as f:
-      self.rules, self.prefix_rules = (
-          statusfile.ReadStatusFile(f.read(), variables))
-
-  def ReadTestCases(self, context):
-    self.tests = self.ListTests(context)
-
-
-  def FilterTestCasesByStatus(self,
-                              slow_tests_mode=None,
-                              pass_fail_tests_mode=None):
-    """Filters tests by outcomes from status file.
-
-    Status file has to be loaded before using this function.
-
-    Args:
-      slow_tests_mode: What to do with slow tests.
-      pass_fail_tests_mode: What to do with pass or fail tests.
-
-    Mode options:
-      None (default) - don't skip
-      "skip" - skip if slow/pass_fail
-      "run" - skip if not slow/pass_fail
-    """
-    def _skip_slow(is_slow, mode):
-      return (
-        (mode == 'run' and not is_slow) or
-        (mode == 'skip' and is_slow))
-
-    def _skip_pass_fail(pass_fail, mode):
-      return (
-        (mode == 'run' and not pass_fail) or
-        (mode == 'skip' and pass_fail))
-
-    def _compliant(test):
-      outcomes = self.GetStatusFileOutcomes(test.name, test.variant)
-      if statusfile.DoSkip(outcomes):
-        return False
-      if _skip_slow(statusfile.IsSlow(outcomes), slow_tests_mode):
-        return False
-      if _skip_pass_fail(statusfile.IsPassOrFail(outcomes),
-                         pass_fail_tests_mode):
-        return False
-      return True
-
-    self.tests = filter(_compliant, self.tests)
-
-  def WarnUnusedRules(self, check_variant_rules=False):
-    """Finds and prints unused rules in status file.
-
-    Rule X is unused when it doesn't apply to any tests, which can also mean
-    that all matching tests were skipped by another rule before evaluating X.
-
-    Status file has to be loaded before using this function.
-    """
-
-    if check_variant_rules:
-      variants = list(ALL_VARIANTS)
-    else:
-      variants = ['']
-    used_rules = set()
-
-    for test in self.tests:
-      variant = test.variant or ""
-
-      if test.name in self.rules.get(variant, {}):
-        used_rules.add((test.name, variant))
-        if statusfile.DoSkip(self.rules[variant][test.name]):
-          continue
-
-      for prefix in self.prefix_rules.get(variant, {}):
-        if test.name.startswith(prefix):
-          used_rules.add((prefix, variant))
-          if statusfile.DoSkip(self.prefix_rules[variant][prefix]):
-            break
-
-    for variant in variants:
-      for rule, value in (list(self.rules.get(variant, {}).iteritems()) +
-                          list(self.prefix_rules.get(variant, {}).iteritems())):
-        if (rule, variant) not in used_rules:
-          if variant == '':
-            variant_desc = 'variant independent'
-          else:
-            variant_desc = 'variant: %s' % variant
-          print('Unused rule: %s -> %s (%s)' % (rule, value, variant_desc))
-
-  def FilterTestCasesByArgs(self, args):
-    """Filter test cases based on command-line arguments.
-
-    args can be a glob: asterisks in any position of the argument
-    represent zero or more characters. Without asterisks, only exact matches
-    will be used with the exeption of the test-suite name as argument.
-    """
-    filtered = []
-    globs = []
-    for a in args:
-      argpath = a.split('/')
-      if argpath[0] != self.name:
-        continue
-      if len(argpath) == 1 or (len(argpath) == 2 and argpath[1] == '*'):
-        return  # Don't filter, run all tests in this suite.
-      path = '/'.join(argpath[1:])
-      globs.append(path)
-
-    for t in self.tests:
-      for g in globs:
-        if fnmatch.fnmatch(t.path, g):
-          filtered.append(t)
-          break
-    self.tests = filtered
-
-  def GetStatusFileOutcomes(self, testname, variant=None):
-    """Gets outcomes from status file.
-
-    Merges variant dependent and independent rules. Status file has to be loaded
-    before using this function.
-    """
-
-    variant = variant or ''
-    cache_key = '%s$%s' % (testname, variant)
-
-    if cache_key not in self._outcomes_cache:
-      # Load statusfile to get outcomes for the first time.
-      assert(self.rules is not None)
-      assert(self.prefix_rules is not None)
-
-      outcomes = frozenset()
-
-      for key in set([variant, '']):
-        rules = self.rules.get(key, {})
-        prefix_rules = self.prefix_rules.get(key, {})
-
-        if testname in rules:
-          outcomes |= rules[testname]
-
-        for prefix in prefix_rules:
-          if testname.startswith(prefix):
-            outcomes |= prefix_rules[prefix]
-
-      self._outcomes_cache[cache_key] = outcomes
-
-    return self._outcomes_cache[cache_key]
-
-  def IsFailureOutput(self, testcase, output):
-    return output.exit_code != 0
-
-  def IsNegativeTest(self, testcase):
-    return False
-
-  def HasFailed(self, testcase, output):
-    execution_failed = self.IsFailureOutput(testcase, output)
-    if self.IsNegativeTest(testcase):
-      return not execution_failed
-    else:
-      return execution_failed
-
-  def GetOutcome(self, testcase, output):
-    if output.HasCrashed():
-      return statusfile.CRASH
-    elif output.HasTimedOut():
-      return statusfile.TIMEOUT
-    elif self.HasFailed(testcase, output):
-      return statusfile.FAIL
-    else:
-      return statusfile.PASS
-
-  def HasUnexpectedOutput(self, testcase, output, ctx=None):
-    if ctx and ctx.predictable:
-      # Only check the exit code of the predictable_wrapper in
-      # verify-predictable mode. Negative tests are not supported as they
-      # usually also don't print allocation hashes. There are two versions of
-      # negative tests: one specified by the test, the other specified through
-      # the status file (e.g. known bugs).
-      return (
-          output.exit_code != 0 and
-          not self.IsNegativeTest(testcase) and
-          statusfile.FAIL not in testcase.expected_outcomes
-      )
-    return self.GetOutcome(testcase, output) not in testcase.expected_outcomes
-
-  def _create_test(self, path, **kwargs):
-    test = self._test_class()(self, path, self._path_to_name(path), **kwargs)
-    return test
+    return None
 
   def _test_class(self):
     raise NotImplementedError
-
-  def _path_to_name(self, path):
-    if utils.IsWindows():
-      return path.replace("\\", "/")
-    return path
-
-
-class StandardVariantGenerator(VariantGenerator):
-  def FilterVariantsByTest(self, testcase):
-    return self.standard_variant
